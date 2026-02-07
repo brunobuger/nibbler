@@ -1,0 +1,56 @@
+## Example `phases.yaml`
+## This file defines the phase graph, gates, and global lifetime budget.
+
+phases:
+  # Discovery produces `vision.md` and `architecture.md`.
+  - id: discovery
+    actors: ["architect"]
+    inputBoundaries: ["**/*"]
+    outputBoundaries: ["vision.md", "architecture.md"]
+    preconditions:
+      - { type: "always" }
+    completionCriteria:
+      - { type: "artifact_exists", pattern: "vision.md" }
+      - { type: "artifact_exists", pattern: "architecture.md" }
+    successors:
+      - { on: "done", next: "planning" }
+
+  # Planning produces job-local artifacts in `.nibbler/jobs/<id>/plan/`.
+  - id: planning
+    actors: ["architect"]
+    inputBoundaries: ["vision.md", "architecture.md"]
+    outputBoundaries: [".nibbler/jobs/<id>/plan/**"]
+    preconditions:
+      - { type: "always" }
+    completionCriteria:
+      - { type: "artifact_exists", pattern: ".nibbler/jobs/<id>/plan/acceptance.md" }
+    successors:
+      - { on: "done", next: "execution" }
+
+  # Execution performs implementation work.
+  - id: execution
+    actors: ["worker"]
+    inputBoundaries: ["src/**", "tests/**"]
+    outputBoundaries: ["src/**", "tests/**"]
+    preconditions:
+      - { type: "always" }
+    completionCriteria:
+      - { type: "diff_non_empty" }
+    successors: []
+    isTerminal: true
+
+gates:
+  # A PO gate on the transition `planning->execution`.
+  - id: plan
+    trigger: "planning->execution"
+    audience: "PO"
+    requiredInputs:
+      - { name: "acceptance", kind: "path", value: ".nibbler/jobs/<id>/plan/acceptance.md" }
+    outcomes:
+      approve: "execution"
+      reject: "planning"
+
+globalLifetime:
+  # Global time budget for the job.
+  maxTimeMs: 1800000
+

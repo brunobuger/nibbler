@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.nibbler/jobs/
+.nibbler-staging/
+.cursor/rules/20-role-*.mdc

@@ -1,0 +1,58 @@
+## Example `team.yaml`
+## This file defines roles and their constraints.
+
+roles:
+  # The Architect role typically produces plans and resolves escalations.
+  - id: architect
+    # Scope is enforced post-hoc via git diff checks.
+    # Keep it narrow; overlaps should be declared in sharedScopes.
+    scope:
+      - "src/**"
+      - "tests/**"
+      - "README.md"
+      - "docs/**"
+    authority:
+      # Cursor CLI command allow-list (optional).
+      allowedCommands:
+        - "npm test"
+        - "npm run lint"
+      allowedPaths: []
+    outputExpectations:
+      - "planning artifacts"
+      - "architecture decisions"
+    verificationMethod:
+      # v1 supports `none` (completion criteria are phase-level).
+      kind: "none"
+    budget:
+      # Max attempts for this role session within one phase actor execution.
+      maxIterations: 2
+      # Escalation target when budget is exhausted.
+      exhaustionEscalation: "exception_gate"
+
+  # A generic worker role that implements changes.
+  - id: worker
+    scope:
+      - "src/**"
+      - "tests/**"
+    authority:
+      allowedCommands:
+        - "npm test"
+      allowedPaths: []
+    outputExpectations:
+      - "implementation"
+    verificationMethod:
+      kind: "none"
+    budget:
+      maxIterations: 3
+      exhaustionEscalation: "architect"
+
+# If two roles can touch the same files, declare it explicitly.
+sharedScopes:
+  - roles: ["architect", "worker"]
+    patterns:
+      - "src/**"
+      - "tests/**"
+
+# Optional escalation steps (engine can also use role budget exhaustionEscalation).
+escalationChain: []
+
