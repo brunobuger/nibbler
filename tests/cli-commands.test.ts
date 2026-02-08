@@ -43,15 +43,6 @@ escalationChain: []
   await writeFile(
     join(contractDir, 'phases.yaml'),
     `phases:
-  - id: discovery
-    actors: ["architect"]
-    inputBoundaries: ["**/*"]
-    outputBoundaries: ["vision.md", "architecture.md"]
-    preconditions: [{ type: "always" }]
-    completionCriteria:
-      - { type: "artifact_exists", pattern: "vision.md" }
-      - { type: "artifact_exists", pattern: "architecture.md" }
-    successors: [{ on: "done", next: "planning" }]
   - id: planning
     actors: ["architect"]
     inputBoundaries: ["vision.md", "architecture.md"]
@@ -74,6 +65,10 @@ globalLifetime:
 `,
     'utf8'
   );
+
+  // Build now requires vision.md + architecture.md to exist before running.
+  await writeFile(join(repoRoot, 'vision.md'), '# vision\n', 'utf8');
+  await writeFile(join(repoRoot, 'architecture.md'), '# arch\n', 'utf8');
 
   await execa('git', ['add', '-A'], { cwd: repoRoot });
   await execa('git', ['commit', '-m', 'setup contract'], { cwd: repoRoot });
@@ -99,12 +94,7 @@ describe('CLI commands (mocked runner)', () => {
     await setupMinimalContract(repoRoot);
 
     const runner = new MockRunnerAdapter({
-      architect: async ({ workspacePath, attempt }) => {
-        if (attempt === 1) {
-          await writeFile(join(workspacePath, 'vision.md'), '# vision\n', 'utf8');
-          await writeFile(join(workspacePath, 'architecture.md'), '# arch\n', 'utf8');
-          return;
-        }
+      architect: async ({ workspacePath }) => {
         const jobsDir = join(workspacePath, '.nibbler', 'jobs');
         const entries = await (await import('node:fs/promises')).readdir(jobsDir);
         const jobId = entries.find((e) => e.startsWith('j-'))!;
@@ -160,12 +150,6 @@ tasks:
   it('fix runs starting from planning and materializes staged plan artifacts', async () => {
     const { dir: repoRoot } = await createTempGitRepo();
     await setupMinimalContract(repoRoot);
-
-    // Create existing vision/architecture so fix can skip discovery.
-    await writeFile(join(repoRoot, 'vision.md'), '# vision\n', 'utf8');
-    await writeFile(join(repoRoot, 'architecture.md'), '# arch\n', 'utf8');
-    await execa('git', ['add', '-A'], { cwd: repoRoot });
-    await execa('git', ['commit', '-m', 'add vision+arch'], { cwd: repoRoot });
 
     const runner = new MockRunnerAdapter({
       architect: async ({ workspacePath }) => {

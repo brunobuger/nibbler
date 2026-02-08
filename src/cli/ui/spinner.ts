@@ -26,7 +26,11 @@ export interface SpinnerHandle {
 export function startSpinner(text: string): SpinnerHandle {
   const isTTY = process.stderr.isTTY;
 
-  if (!isTTY || process.env.NIBBLER_QUIET === '1' || process.env.NO_COLOR != null) {
+  // NOTE:
+  // - `NO_COLOR` should disable colors, not spinners.
+  // - Some environments set `CI=1` even locally; `ora` disables spinners by default
+  //   in CI, so we explicitly force-enable when stderr is a TTY.
+  if (!isTTY || process.env.NIBBLER_QUIET === '1') {
     // Non-interactive fallback: static lines.
     process.stderr.write(`  ${text}\n`);
     return {
@@ -56,6 +60,7 @@ export function startSpinner(text: string): SpinnerHandle {
     stream: process.stderr,
     spinner: 'dots',
     indent: 2,
+    isEnabled: true,
   }).start();
 
   return {

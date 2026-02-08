@@ -1,6 +1,6 @@
 import { basename } from 'node:path';
 
-import type { RunnerAdapter } from '../src/core/session/runner.js';
+import type { RunnerAdapter, RunnerTaskType } from '../src/core/session/runner.js';
 import type { NibblerEvent, RunnerCapabilities, SessionHandle } from '../src/core/session/types.js';
 
 class AsyncQueue<T> implements AsyncIterable<T> {
@@ -38,17 +38,22 @@ export type RoleAction = (args: {
   attempt: number;
   message: string;
   mode: 'normal' | 'plan';
+  taskType: RunnerTaskType;
+  emit: (ev: NibblerEvent) => void;
+  end: () => void;
 }) => Promise<void> | void;
 
 export class MockRunnerAdapter implements RunnerAdapter {
   private qByHandle = new Map<string, AsyncQueue<NibblerEvent>>();
   private roleByHandle = new Map<string, string>();
   private modeByHandle = new Map<string, 'normal' | 'plan'>();
+  private taskTypeByHandle = new Map<string, RunnerTaskType>();
+  private interactiveByHandle = new Map<string, boolean>();
   private alive = new Set<string>();
   private attemptByRole = new Map<string, number>();
 
   readonly startedRoles: string[] = [];
-  readonly startedSessions: Array<{ roleId: string; mode: 'normal' | 'plan' }> = [];
+  readonly startedSessions: Array<{ roleId: string; mode: 'normal' | 'plan'; taskType: RunnerTaskType }> = [];
 
   constructor(private actions: Record<string, RoleAction> = {}) {}
 
@@ -60,7 +65,7 @@ export class MockRunnerAdapter implements RunnerAdapter {
     workspacePath: string,
     _envVars: Record<string, string>,
     configDir: string,
-    options?: { mode?: 'normal' | 'plan' }
+    options?: { mode?: 'normal' | 'plan'; interactive?: boolean; taskType?: RunnerTaskType }
   ): Promise<SessionHandle> {
     const roleId = basename(configDir);
     const id = `h-${Math.random().toString(16).slice(2)}`;
@@ -68,9 +73,13 @@ export class MockRunnerAdapter implements RunnerAdapter {
     const handle: SessionHandle = { id, startedAtIso: now, lastActivityAtIso: now, pid: 1 };
 
     this.startedRoles.push(roleId);
-    this.startedSessions.push({ roleId, mode: options?.mode ?? 'normal' });
+    const mode = options?.mode ?? 'normal';
+    const taskType: RunnerTaskType = options?.taskType ?? (mode === 'plan' ? 'plan' : 'execute');
+    this.startedSessions.push({ roleId, mode, taskType });
     this.roleByHandle.set(id, roleId);
-    this.modeByHandle.set(id, options?.mode ?? 'normal');
+    this.modeByHandle.set(id, mode);
+    this.taskTypeByHandle.set(id, taskType);
+    this.interactiveByHandle.set(id, options?.interactive === true);
     this.qByHandle.set(id, new AsyncQueue<NibblerEvent>());
     this.alive.add(id);
 
@@ -88,6 +97,8 @@ export class MockRunnerAdapter implements RunnerAdapter {
     if (!roleId) throw new Error('unknown handle role');
 
     const mode = this.modeByHandle.get(handle.id) ?? 'normal';
+    const taskType = this.taskTypeByHandle.get(handle.id) ?? (mode === 'plan' ? 'plan' : 'execute');
+    const interactive = this.interactiveByHandle.get(handle.id) ?? false;
     const nextAttempt = (this.attemptByRole.get(roleId) ?? 0) + 1;
     const attempt = nextAttempt;
     // Two-step execution: plan sessions should not advance the "attempt" counter.
@@ -97,13 +108,37 @@ export class MockRunnerAdapter implements RunnerAdapter {
 
     const workspacePath = (handle as any).__workspacePath as string;
     const action = this.actions[roleId];
-    if (action) await action({ workspacePath, roleId, attempt, message, mode });
-
     const q = this.qByHandle.get(handle.id);
     if (!q) throw new Error('missing queue');
-    q.push({ type: 'PHASE_COMPLETE', summary: `role=${roleId} attempt=${attempt}` });
-    q.close();
-    this.alive.delete(handle.id);
+
+    let ended = false;
+    let emittedAny = false;
+    const emit = (ev: NibblerEvent) => {
+      emittedAny = true;
+      q.push(ev);
+      if (ev.type === 'PHASE_COMPLETE') {
+        // If a session completes, treat it as terminal for this handle.
+        ended = true;
+      }
+    };
+    const end = () => {
+      ended = true;
+    };
+
+    if (action) await action({ workspacePath, roleId, attempt, message, mode, taskType, emit, end });
+
+    // Default behavior: if no events were emitted, complete immediately.
+    if (!emittedAny) {
+      emit({ type: 'PHASE_COMPLETE', summary: `role=${roleId} attempt=${attempt}` });
+    }
+
+    // Non-interactive sessions always end after one send.
+    if (!interactive) ended = true;
+
+    if (ended) {
+      q.close();
+      this.alive.delete(handle.id);
+    }
   }
 
   readEvents(handle: SessionHandle): AsyncIterable<NibblerEvent> {

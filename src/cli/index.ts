@@ -42,10 +42,17 @@ export function buildCli(argv: string[]) {
   program
     .command('init')
     .description('Generate or review the governance contract')
+    .option('--file <path>', 'Input document for discovery (repeatable)', collectRepeatable, [])
     .option('--review', 'Review/update an existing contract')
+    .option('--skip-discovery', 'Skip discovery (use existing vision.md + architecture.md)')
     .option('--dry-run', 'Validate without writing contract/committing')
-    .action(async (opts: { review?: boolean; dryRun?: boolean }) => {
-      const res = await runInitCommand({ review: !!opts.review, dryRun: !!opts.dryRun });
+    .action(async (opts: { file: string[]; review?: boolean; skipDiscovery?: boolean; dryRun?: boolean }) => {
+      const res = await runInitCommand({
+        review: !!opts.review,
+        dryRun: !!opts.dryRun,
+        skipDiscovery: !!opts.skipDiscovery,
+        files: opts.file ?? [],
+      });
       if (!res.ok) {
         if ((res.errors as any)?.reason === 'cancelled') {
           const r = getRenderer();
@@ -65,18 +72,16 @@ export function buildCli(argv: string[]) {
 
   program
     .command('build')
-    .description('Run a full job: discover → plan → execute → ship')
+    .description('Run a full job: plan → execute → ship')
     .argument('[requirement]', 'Requirement string')
     .option('--file <path>', 'Input document (repeatable)', collectRepeatable, [])
-    .option('--dry-run', 'Discovery + planning only (prints plan)')
-    .option('--skip-discovery', 'Skip discovery (use existing vision.md)')
+    .option('--dry-run', 'Planning only (prints plan)')
     .option('--skip-scaffold', 'Skip scaffolding even if repo appears empty')
-    .action(async (requirement: string | undefined, opts: { file: string[]; dryRun?: boolean; skipDiscovery?: boolean; skipScaffold?: boolean }) => {
+    .action(async (requirement: string | undefined, opts: { file: string[]; dryRun?: boolean; skipScaffold?: boolean }) => {
       const res = await runBuildCommand({
         requirement,
         files: opts.file ?? [],
         dryRun: !!opts.dryRun,
-        skipDiscovery: !!opts.skipDiscovery,
         skipScaffold: !!opts.skipScaffold,
       });
       if (!res.ok) {

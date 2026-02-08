@@ -60,7 +60,10 @@ export class SessionController {
     env.NIBBLER_JOB_ID = job.jobId;
     env.NIBBLER_ROLE_ID = roleId;
 
-    const handle = await this.runner.spawn(this.workspace, env, profileDir, { mode: mode === 'plan' ? 'plan' : 'normal' });
+    const handle = await this.runner.spawn(this.workspace, env, profileDir, {
+      mode: mode === 'plan' ? 'plan' : 'normal',
+      taskType: mode === 'plan' ? 'plan' : 'execute'
+    });
     await this.runner.send(
       handle,
       options.bootstrapPrompt ?? this.opts.bootstrapPrompt ?? 'Begin your assigned work as described in the project rules overlay.'

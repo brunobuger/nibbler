@@ -36,29 +36,3 @@ export interface IngestedContext {
   signals: CodebaseSignals;
 }
 
-export type QuestionStatus = 'gap' | 'inferred' | 'confirmed' | 'answered';
-
-export interface Question {
-  id: string;
-  ask: string;
-  status: QuestionStatus;
-  inferredAnswer?: string;
-  confidence?: Confidence;
-  answer?: string;
-}
-
-export interface QuestionSection {
-  id: string;
-  label: string;
-  questions: Question[];
-}
-
-export interface DiscoverySchema {
-  projectType: ProjectType;
-  tiers: {
-    tier1: QuestionSection[];
-    tier2: QuestionSection[];
-    tier3: QuestionSection[];
-  };
-}
-

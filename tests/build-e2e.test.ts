@@ -55,15 +55,6 @@ escalationChain: []
   await writeFile(
     join(contractDir, 'phases.yaml'),
     `phases:
-  - id: discovery
-    actors: ["architect"]
-    inputBoundaries: ["**/*"]
-    outputBoundaries: ["vision.md", "architecture.md"]
-    preconditions: [{ type: "always" }]
-    completionCriteria:
-      - { type: "artifact_exists", pattern: "vision.md" }
-      - { type: "artifact_exists", pattern: "architecture.md" }
-    successors: [{ on: "done", next: "planning" }]
   - id: planning
     actors: ["architect"]
     inputBoundaries: ["vision.md", "architecture.md"]
@@ -87,6 +78,10 @@ globalLifetime:
     'utf8'
   );
 
+  // Build now requires vision.md + architecture.md to exist before running.
+  await writeFile(join(repoRoot, 'vision.md'), '# vision\n', 'utf8');
+  await writeFile(join(repoRoot, 'architecture.md'), '# arch\n', 'utf8');
+
   await execa('git', ['add', '-A'], { cwd: repoRoot });
   await execa('git', ['commit', '-m', 'setup contract'], { cwd: repoRoot });
 }
@@ -100,17 +95,12 @@ async function detectJobId(repoRoot: string): Promise<string> {
 }
 
 describe('nibbler build (e2e, mocked)', () => {
-  it('happy path: discovery -> planning -> execution', async () => {
+  it('happy path: planning -> execution', async () => {
     const { dir: repoRoot } = await createTempGitRepo();
     await setupContract(repoRoot);
 
     const runner = new MockRunnerAdapter({
-      architect: async ({ workspacePath, attempt }) => {
-        if (attempt === 1) {
-          await writeFile(join(workspacePath, 'vision.md'), '# vision\n', 'utf8');
-          await writeFile(join(workspacePath, 'architecture.md'), '# arch\n', 'utf8');
-          return;
-        }
+      architect: async ({ workspacePath }) => {
         const jobId = await detectJobId(workspacePath);
         const staged = join(workspacePath, '.nibbler-staging', 'plan', jobId);
         await mkdir(staged, { recursive: true });
@@ -163,12 +153,7 @@ tasks:
     await setupContract(repoRoot, { workerMaxIterations: 2 });
 
     const runner = new MockRunnerAdapter({
-      architect: async ({ workspacePath, attempt }) => {
-        if (attempt === 1) {
-          await writeFile(join(workspacePath, 'vision.md'), '# vision\n', 'utf8');
-          await writeFile(join(workspacePath, 'architecture.md'), '# arch\n', 'utf8');
-          return;
-        }
+      architect: async ({ workspacePath }) => {
         const jobId = await detectJobId(workspacePath);
         const staged = join(workspacePath, '.nibbler-staging', 'plan', jobId);
         await mkdir(staged, { recursive: true });
@@ -221,12 +206,7 @@ tasks:
     await setupContract(repoRoot, { workerMaxIterations: 1 });
 
     const runner = new MockRunnerAdapter({
-      architect: async ({ workspacePath, attempt }) => {
-        if (attempt === 1) {
-          await writeFile(join(workspacePath, 'vision.md'), '# vision\n', 'utf8');
-          await writeFile(join(workspacePath, 'architecture.md'), '# arch\n', 'utf8');
-          return;
-        }
+      architect: async ({ workspacePath }) => {
         const jobId = await detectJobId(workspacePath);
         const staged = join(workspacePath, '.nibbler-staging', 'plan', jobId);
         await mkdir(staged, { recursive: true });
@@ -273,11 +253,6 @@ tasks:
 
     const runner = new MockRunnerAdapter({
       architect: async ({ workspacePath, attempt }) => {
-        if (attempt === 1) {
-          await writeFile(join(workspacePath, 'vision.md'), '# vision\n', 'utf8');
-          await writeFile(join(workspacePath, 'architecture.md'), '# arch\n', 'utf8');
-          return;
-        }
         const jobId = await detectJobId(workspacePath);
         const staged = join(workspacePath, '.nibbler-staging', 'plan', jobId);
         await mkdir(staged, { recursive: true });
@@ -325,9 +300,26 @@ tasks:
 
     const runner = new MockRunnerAdapter({
       architect: async ({ workspacePath }) => {
-        await writeFile(join(workspacePath, 'vision.md'), '# vision\n', 'utf8');
-        await writeFile(join(workspacePath, 'architecture.md'), '# arch\n', 'utf8');
-      }
+        const jobId = await detectJobId(workspacePath);
+        const staged = join(workspacePath, '.nibbler-staging', 'plan', jobId);
+        await mkdir(staged, { recursive: true });
+        await writeFile(join(staged, 'acceptance.md'), '# acceptance\n', 'utf8');
+        await writeFile(
+          join(staged, 'delegation.yaml'),
+          `version: 1
+tasks:
+  - taskId: t1
+    roleId: worker
+    description: implement x
+    scopeHints: ["src/**"]
+    priority: 1
+`,
+          'utf8'
+        );
+      },
+      worker: async ({ workspacePath }) => {
+        await writeFile(join(workspacePath, 'OUT_OF_SCOPE.md'), 'nope\n', 'utf8');
+      },
     });
 
     process.env.NIBBLER_TEST_AUTO_APPROVE = '1';

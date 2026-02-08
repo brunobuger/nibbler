@@ -14,6 +14,11 @@ describe('nibbler init', () => {
     await mkdir(join(repoRoot, '.git'), { recursive: true });
 
     const actions: Record<string, RoleAction> = {
+      discovery: async ({ workspacePath }) => {
+        // Discovery produces the durable artifacts used for contract proposal.
+        await writeFile(join(workspacePath, 'vision.md'), '# vision\n', 'utf8');
+        await writeFile(join(workspacePath, 'architecture.md'), '# architecture\n', 'utf8');
+      },
       init: async ({ workspacePath }) => {
         const staging = join(workspacePath, '.nibbler-staging', 'contract');
         await mkdir(staging, { recursive: true });

@@ -17,6 +17,8 @@ import { isPidAlive, joinRepoPath, jobLedgerPath, readJobStatus } from '../jobs.
 import { getRenderer } from '../ui/renderer.js';
 import { theme } from '../ui/theme.js';
 import { installCliCancellation } from '../cancel.js';
+import { roleLabel } from '../ui/format.js';
+import type { SpinnerHandle } from '../ui/spinner.js';
 
 export interface ResumeCommandOptions {
   repoRoot?: string;
@@ -73,13 +75,22 @@ export async function runResumeCommand(opts: ResumeCommandOptions): Promise<{ ok
   const runner = opts.runner ?? new CursorRunnerAdapter();
   const sessions = new SessionController(runner, repoRoot, { inactivityTimeoutMs: 120_000 });
 
+  let activeRoleSpinner: SpinnerHandle | null = null;
+  let activeRoleId: string | null = null;
+  const stopActiveRoleSpinner = (roleId: string, ok: boolean) => {
+    if (!activeRoleSpinner || activeRoleId !== roleId) return;
+    const prefix = roleLabel(roleId);
+    if (ok) activeRoleSpinner.succeed(`${prefix}Session complete`);
+    else activeRoleSpinner.fail(`${prefix}Session needs revision`);
+    activeRoleSpinner = null;
+    activeRoleId = null;
+  };
+
   const jm = new JobManager(sessions, gates, evidence, ledger, {
     onRoleStart: ({ roleId, attempt, maxAttempts }) => {
-      if (attempt === 1) {
-        r.roleWorking(roleId, 'Starting session...');
-      } else {
-        r.roleRetry(roleId, attempt, maxAttempts);
-      }
+      activeRoleSpinner?.stop();
+      activeRoleId = roleId;
+      activeRoleSpinner = r.spinner(`${roleLabel(roleId)}Starting session (attempt ${attempt}/${maxAttempts})...`);
     },
     onRoleComplete: ({ roleId, durationMs, diff }) => {
       const fileCount = diff.summary.filesChanged;
@@ -87,6 +98,7 @@ export async function runResumeCommand(opts: ResumeCommandOptions): Promise<{ ok
       r.roleComplete(roleId, `${fileCount} file${fileCount !== 1 ? 's' : ''} changed (${lines} lines)`, durationMs);
     },
     onVerification: ({ roleId, scopePassed, completionPassed, scopeViolations, diff }) => {
+      stopActiveRoleSpinner(roleId, scopePassed && completionPassed);
       r.verificationStart(roleId);
       r.verificationResult(roleId, [
         { name: 'Scope check', passed: scopePassed, detail: scopePassed ? `${diff.summary.filesChanged} files, 0 violations` : `${scopeViolations?.length ?? 0} violation(s)` },
@@ -97,6 +109,7 @@ export async function runResumeCommand(opts: ResumeCommandOptions): Promise<{ ok
       r.handoff(fromRole, toRole);
     },
     onEscalation: ({ roleId, reason }) => {
+      stopActiveRoleSpinner(roleId, false);
       r.roleEscalation(roleId, reason);
     },
   });

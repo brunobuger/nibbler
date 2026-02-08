@@ -21,15 +21,6 @@ sharedScopes:
     patterns: ["src/**", "tests/**"]
 
 phases:
-  - id: discovery
-    actors: ["architect"]
-    inputBoundaries: ["**/*"]
-    outputBoundaries: ["vision.md", "architecture.md"]
-    preconditions: [{ type: "always" }]
-    completionCriteria:
-      - { type: "artifact_exists", pattern: "vision.md" }
-      - { type: "artifact_exists", pattern: "architecture.md" }
-    successors: [{ on: "done", next: "planning" }]
   - id: planning
     actors: ["architect"]
     inputBoundaries: ["vision.md", "architecture.md"]
@@ -52,7 +43,8 @@ gates:
     trigger: "planning->execution"
     audience: "PO"
     requiredInputs:
-      - { name: "discovery", kind: "path", value: ".nibbler/jobs/<id>/plan/discovery.json" }
+      - { name: "vision", kind: "path", value: "vision.md" }
+      - { name: "architecture", kind: "path", value: "architecture.md" }
     outcomes: { approve: "execution", reject: "planning" }
 
 globalLifetime:
@@ -83,15 +75,6 @@ sharedScopes:
     patterns: ["src/**", "tests/**"]
 
 phases:
-  - id: discovery
-    actors: ["architect"]
-    inputBoundaries: ["**/*"]
-    outputBoundaries: ["vision.md", "architecture.md"]
-    preconditions: [{ type: "always" }]
-    completionCriteria:
-      - { type: "artifact_exists", pattern: "vision.md" }
-      - { type: "artifact_exists", pattern: "architecture.md" }
-    successors: [{ on: "done", next: "execution" }]
   - id: execution
     actors: ["worker"]
     inputBoundaries: ["src/**", "tests/**"]
@@ -104,12 +87,12 @@ phases:
 
 gates:
   - id: ship
-    trigger: "discovery->execution"
+    trigger: "execution->execution"
     audience: "PO"
     requiredInputs:
       - { name: "vision", kind: "path", value: "vision.md" }
       - { name: "architecture", kind: "path", value: "architecture.md" }
-    outcomes: { approve: "execution", reject: "discovery" }
+    outcomes: { approve: "execution", reject: "execution" }
 
 globalLifetime:
   maxTimeMs: 1800000
@@ -139,15 +122,6 @@ sharedScopes:
     patterns: ["src/**", "tests/**"]
 
 phases:
-  - id: discovery
-    actors: ["architect"]
-    inputBoundaries: ["**/*"]
-    outputBoundaries: ["vision.md", "architecture.md"]
-    preconditions: [{ type: "always" }]
-    completionCriteria:
-      - { type: "artifact_exists", pattern: "vision.md" }
-      - { type: "artifact_exists", pattern: "architecture.md" }
-    successors: [{ on: "done", next: "execution" }]
   - id: execution
     actors: ["worker"]
     inputBoundaries: ["src/**", "tests/**"]
@@ -159,11 +133,11 @@ phases:
 
 gates:
   - id: plan
-    trigger: "discovery->execution"
+    trigger: "execution->execution"
     audience: "PO"
     requiredInputs:
       - { name: "vision", kind: "path", value: "vision.md" }
-    outcomes: { approve: "execution", reject: "discovery" }
+    outcomes: { approve: "execution", reject: "execution" }
 
 globalLifetime:
   maxTimeMs: 1800000

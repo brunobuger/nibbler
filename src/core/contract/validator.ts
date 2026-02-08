@@ -89,12 +89,18 @@ export function validateContract(contract: Contract): ValidationError[] {
     }
   }
 
-  // Dependency satisfaction (Rule 2.2) — conservative: every input boundary must be produced by some phase output boundary.
+  // Dependency satisfaction (Rule 2.2).
+  //
+  // IMPORTANT: A phase may legitimately consume pre-existing repo artifacts that are not produced by any
+  // phase output boundary (e.g. `vision.md`/`architecture.md` created during `nibbler init`, or an existing `src/**` tree).
+  //
+  // For v1 we only enforce 2.2 for inputs that look like engine-managed job artifacts (e.g. `.nibbler/jobs/<id>/...`),
+  // which cannot be pre-existing outside of a job run. This avoids rejecting valid contracts that start at planning.
   const outputs = contract.phases.flatMap((p) => p.outputBoundaries.map((pat) => ({ phase: p.id, pat })));
   for (const phase of contract.phases) {
     for (const input of phase.inputBoundaries) {
       const ok = outputs.some((o) => patternsMayOverlap(input, o.pat));
-      if (!ok) {
+      if (!ok && shouldRequireUpstreamProducer(input)) {
         errors.push({
           rule: '2.2',
           message: `Rule 2.2: Phase '${phase.id}' requires input '${input}' but no phase output boundary appears to produce it`
@@ -152,6 +158,15 @@ function staticPrefix(pat: string): string {
   const idx = m ? m.index : pat.length;
   const prefix = pat.slice(0, idx);
   return prefix.replace(/\/+$/, '');
+}
+
+function shouldRequireUpstreamProducer(inputBoundary: string): boolean {
+  const p = inputBoundary.trim();
+  if (!p) return false;
+  // Job-scoped placeholders / paths are always engine-produced.
+  if (p.includes('<id>') || p.includes('<job-id>') || p.includes('<jobId>')) return true;
+  // Anything under .nibbler/ is engine-managed state, not pre-existing repo content.
+  return p.startsWith('.nibbler/') || p.startsWith('.nibbler\\');
 }
 
 function validateGates(gates: GateDefinition[]): ValidationError[] {

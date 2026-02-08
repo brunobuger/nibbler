@@ -1,11 +1,11 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, rm } from 'node:fs/promises';
+import { mkdir, readdir, rm, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 import { execa } from 'execa';
 
 import { readContract, writeContract } from '../../core/contract/reader.js';
-import { validateContract } from '../../core/contract/validator.js';
+import { validateContract, type ValidationError } from '../../core/contract/validator.js';
 import type { Contract } from '../../core/contract/types.js';
 import { CursorRunnerAdapter } from '../../core/session/cursor-adapter.js';
 import type { RunnerAdapter } from '../../core/session/runner.js';
@@ -16,6 +16,7 @@ import { scanProjectState } from '../../workspace/scanner.js';
 import { renderInitBootstrapPrompt } from '../../templates/bootstrap-prompt.js';
 import { commit, git, isClean } from '../../git/operations.js';
 import { exampleContracts } from '../../templates/contract-examples/index.js';
+import { runDiscovery } from '../../discovery/engine.js';
 import { getRenderer } from '../ui/renderer.js';
 import { theme } from '../ui/theme.js';
 import { formatMs } from '../ui/format.js';
@@ -25,6 +26,8 @@ import { promptInput, promptSelect } from '../ui/prompts.js';
 export interface InitCommandOptions {
   repoRoot?: string;
   review?: boolean;
+  skipDiscovery?: boolean;
+  files?: string[];
   dryRun?: boolean;
   runner?: RunnerAdapter;
 }
@@ -67,7 +70,7 @@ export async function runInitCommand(opts: InitCommandOptions = {}): Promise<{ o
     await ensureGitignore(repoRoot);
     await writeProtocolRule(repoRoot, defaultProtocolRule());
 
-    const project = await scanProjectState(repoRoot);
+    let project = await scanProjectState(repoRoot);
 
     // Determine repo cleanliness
     let repoClean = true;
@@ -110,7 +113,56 @@ export async function runInitCommand(opts: InitCommandOptions = {}): Promise<{ o
       r.initExplanation();
     }
 
-    // ── Step 3: Generate Contract via Architect ──────────────────────────────
+    // ── Step 3: Discovery (AI-driven, produces vision.md + architecture.md) ─
+    {
+      const wantDiscovery = !opts.skipDiscovery;
+      const hasVision = project.hasVisionMd;
+      const hasArch = project.hasArchitectureMd;
+      const providedFiles = (opts.files ?? []).map((p) => resolve(p));
+
+      if (!wantDiscovery) {
+        if (!hasVision || !hasArch) {
+          return {
+            ok: false,
+            errors: `Discovery skipped but required artifacts are missing: ${!hasVision ? 'vision.md ' : ''}${!hasArch ? 'architecture.md' : ''}`.trim(),
+          };
+        }
+      } else {
+        // If either artifact is missing, run discovery.
+        if (!hasVision || !hasArch) {
+          const discSpinner = r.spinner('Running discovery (vision + architecture)...');
+          const discDir = join(repoRoot, '.nibbler-staging', 'discovery');
+          await resetDir(discDir);
+          const start = Date.now();
+          try {
+            await runDiscovery({
+              workspace: repoRoot,
+              providedFiles,
+              planDir: discDir,
+              runner,
+              projectState: project,
+              classification: null,
+            });
+            discSpinner.succeed(`Discovery complete ${theme.dim(`(${formatMs(Date.now() - start)})`)}`);
+            // Refresh scan so subsequent prompts know these exist now.
+            project = await scanProjectState(repoRoot);
+          } catch (err: any) {
+            discSpinner.fail(`Discovery failed ${theme.dim(`(${formatMs(Date.now() - start)})`)}`);
+            const msg = String(err?.message ?? err);
+            if (isVerbose()) {
+              r.dim(theme.bold('--- verbose: discovery failure ---'));
+              r.dim(`message: ${msg}`);
+              r.dim(`discoveryPlanDir: ${discDir}`);
+              r.dim(theme.bold('--- end verbose ---'));
+            }
+            return { ok: false, errors: msg };
+          }
+          r.blank();
+        }
+      }
+    }
+
+    // ── Step 4: Generate Contract via Architect ──────────────────────────────
     const stagingDir = join(repoRoot, '.nibbler-staging', 'contract');
     await resetDir(stagingDir);
 
@@ -134,22 +186,25 @@ export async function runInitCommand(opts: InitCommandOptions = {}): Promise<{ o
         return { ok: false, errors: 'init: too many contract revision attempts' };
       }
 
-    const sessionSpinner = r.spinner(
-      attempt === 1
-        ? 'Generating contract...'
-        : `Revising contract (attempt ${attempt})...`,
-    );
-    const sessionStart = Date.now();
+      const sessionSpinner = r.spinner(
+        attempt === 1 ? 'Generating contract...' : `Revising contract (attempt ${attempt})...`,
+      );
+      const sessionStart = Date.now();
 
-    // Build prompt and start architect session
-    const prompt = renderInitBootstrapPrompt({
-      project,
-      existingContractYaml,
-      exampleContracts: Array.from(exampleContracts),
-      contractStagingDir: stagingDir.replaceAll('\\', '/'),
-    }).concat(renderFeedback(feedbackBlocks));
+      // Build prompt and start architect session
+      const prompt = renderInitBootstrapPrompt({
+        project,
+        existingContractYaml,
+        exampleContracts: Array.from(exampleContracts),
+        contractStagingDir: stagingDir.replaceAll('\\', '/'),
+      }).concat(renderFeedback(feedbackBlocks));
 
-    await writeRoleOverlay(repoRoot, 'architect', prompt);
+      if (isVerbose()) {
+        // Keep a durable copy of the exact prompt used for debugging.
+        await writeText(join(repoRoot, '.nibbler-staging', `init-prompt-attempt-${attempt}.md`), prompt);
+      }
+
+      await writeRoleOverlay(repoRoot, 'architect', prompt);
       const handle = await spawnInitSession(runner, repoRoot, join(repoRoot, '.nibbler', 'config', 'cursor-profiles', 'init'));
       activeHandle = handle;
       await runner.send(handle, prompt);
@@ -158,36 +213,53 @@ export async function runInitCommand(opts: InitCommandOptions = {}): Promise<{ o
       await runner.stop(handle);
       activeHandle = null;
 
-    const sessionDuration = Date.now() - sessionStart;
+      const sessionDuration = Date.now() - sessionStart;
 
-    // ── Read and validate staged contract ──────────────────────────────────
-    let proposed: Contract;
-    try {
-      proposed = await readContract(stagingDir);
-    } catch (err) {
-      const msg = `Contract read failed: ${String((err as any)?.message ?? err)}`;
-      feedbackBlocks.push(msg);
-      await appendInitFeedback(repoRoot, msg);
-      sessionSpinner.fail(`Contract generation failed ${theme.dim(`(${formatMs(sessionDuration)})`)}`);
-      r.warn('Architect did not produce valid contract files. Retrying with feedback...');
+      // ── Read and validate staged contract ──────────────────────────────────
+      let proposed: Contract;
+      try {
+        proposed = await readContract(stagingDir);
+      } catch (err) {
+        const msg = `Contract read failed: ${String((err as any)?.message ?? err)}`;
+        feedbackBlocks.push(msg);
+        await appendInitFeedback(repoRoot, msg);
+        sessionSpinner.fail(`Contract generation failed ${theme.dim(`(${formatMs(sessionDuration)})`)}`);
+        r.warn('Architect did not produce valid contract files. Retrying with feedback...');
+        if (isVerbose()) {
+          await renderVerboseInitFailure(r, {
+            stagingDir,
+            attempt,
+            reason: msg,
+            error: err,
+            validationErrors: null,
+          });
+        }
+        r.blank();
+        continue;
+      }
+
+      const errors = validateContract(proposed);
+      if (errors.length) {
+        const msg = `Contract validation errors:\n${JSON.stringify(errors, null, 2)}`;
+        feedbackBlocks.push(msg);
+        await appendInitFeedback(repoRoot, msg);
+        sessionSpinner.fail(`Contract validation failed ${theme.dim(`(${formatMs(sessionDuration)})`)}`);
+        r.warn(`${errors.length} validation error${errors.length > 1 ? 's' : ''}. Retrying with feedback...`);
+        if (isVerbose()) {
+          await renderVerboseInitFailure(r, {
+            stagingDir,
+            attempt,
+            reason: 'Contract validation failed',
+            error: null,
+            validationErrors: errors,
+          });
+        }
+        r.blank();
+        continue;
+      }
+
+      sessionSpinner.succeed(`Contract proposed ${theme.dim(`(${formatMs(sessionDuration)})`)}`);
       r.blank();
-
-      continue;
-    }
-
-    const errors = validateContract(proposed);
-    if (errors.length) {
-      const msg = `Contract validation errors:\n${JSON.stringify(errors, null, 2)}`;
-      feedbackBlocks.push(msg);
-      await appendInitFeedback(repoRoot, msg);
-      sessionSpinner.fail(`Contract validation failed ${theme.dim(`(${formatMs(sessionDuration)})`)}`);
-      r.warn(`${errors.length} validation error${errors.length > 1 ? 's' : ''}. Retrying with feedback...`);
-      r.blank();
-      continue;
-    }
-
-    sessionSpinner.succeed(`Contract proposed ${theme.dim(`(${formatMs(sessionDuration)})`)}`);
-    r.blank();
 
     // ── Step 4: Contract Summary + PO Approval ─────────────────────────────
     r.contractSummary(
@@ -251,6 +323,123 @@ export async function runInitCommand(opts: InitCommandOptions = {}): Promise<{ o
 }
 
 // ── Internal Helpers ────────────────────────────────────────────────────────
+
+function isVerbose(): boolean {
+  return process.env.NIBBLER_VERBOSE === '1';
+}
+
+async function renderVerboseInitFailure(
+  r: ReturnType<typeof getRenderer>,
+  args: {
+    stagingDir: string;
+    attempt: number;
+    reason: string;
+    error: unknown;
+    validationErrors: ValidationError[] | null;
+  }
+): Promise<void> {
+  r.dim(theme.bold('--- verbose: init failure details ---'));
+  r.dim(`attempt: ${args.attempt}`);
+  r.dim(`stagingDir: ${args.stagingDir}`);
+
+  const expected = ['team.yaml', 'phases.yaml'];
+  r.dim(`expectedContractFiles: ${expected.join(', ')}`);
+
+  const staged = await listDirDetailed(args.stagingDir);
+  if (staged.length === 0) {
+    r.dim('stagingContents: (empty)');
+  } else {
+    r.dim('stagingContents:');
+    for (const e of staged) {
+      r.dim(`  - ${e.name}${e.isDir ? '/' : ''}${e.sizeBytes != null ? theme.dim(` (${e.sizeBytes} bytes)`) : ''}`);
+    }
+  }
+
+  r.dim(`reason: ${args.reason}`);
+  if (args.error) {
+    r.dim('error:');
+    for (const line of formatErrorVerbose(args.error).split('\n')) r.dim(`  ${line}`);
+  }
+
+  if (args.validationErrors && args.validationErrors.length > 0) {
+    r.dim('validationErrors:');
+    for (const e of args.validationErrors) {
+      r.dim(`  - [${e.rule}] ${e.message}`);
+      if (e.details != null) {
+        const json = safeStringify(e.details);
+        for (const line of json.split('\n')) r.dim(`      ${line}`);
+      }
+    }
+  }
+
+  // Show last feedback block if present.
+  const feedbackPath = join(args.stagingDir, '..', 'init-feedback.txt');
+  try {
+    const raw = await readText(feedbackPath);
+    const tail = tailLines(raw, 60);
+    r.dim(`feedbackPath: ${feedbackPath}`);
+    r.dim('feedbackTail:');
+    for (const line of tail.split('\n')) r.dim(`  ${line}`);
+  } catch {
+    // ignore
+  }
+
+  const promptPath = join(args.stagingDir, '..', `init-prompt-attempt-${args.attempt}.md`);
+  if (await fileExists(promptPath)) {
+    r.dim(`promptPath: ${promptPath}`);
+  }
+  r.dim(theme.bold('--- end verbose ---'));
+}
+
+async function listDirDetailed(dir: string): Promise<Array<{ name: string; isDir: boolean; sizeBytes: number | null }>> {
+  let names: string[] = [];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return [];
+  }
+  const out: Array<{ name: string; isDir: boolean; sizeBytes: number | null }> = [];
+  for (const name of names.sort((a, b) => a.localeCompare(b))) {
+    try {
+      const s = await stat(join(dir, name));
+      out.push({ name, isDir: s.isDirectory(), sizeBytes: s.isFile() ? s.size : null });
+    } catch {
+      out.push({ name, isDir: false, sizeBytes: null });
+    }
+  }
+  return out;
+}
+
+function formatErrorVerbose(err: unknown): string {
+  if (!err) return 'unknown error';
+  const anyErr = err as any;
+  const name = typeof anyErr?.name === 'string' ? anyErr.name : undefined;
+  const msg = typeof anyErr?.message === 'string' ? anyErr.message : String(err);
+  const stack = typeof anyErr?.stack === 'string' ? anyErr.stack : '';
+
+  const zodIssues = Array.isArray(anyErr?.issues) ? anyErr.issues : null;
+  const issuesText = zodIssues ? safeStringify(zodIssues) : '';
+
+  const parts: string[] = [];
+  parts.push(name ? `${name}: ${msg}` : msg);
+  if (issuesText) parts.push(`issues=${issuesText}`);
+  if (stack) parts.push(stack);
+  return parts.join('\n');
+}
+
+function safeStringify(v: unknown): string {
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch {
+    return String(v);
+  }
+}
+
+function tailLines(text: string, n: number): string {
+  const lines = text.split('\n');
+  const tail = lines.slice(Math.max(0, lines.length - n));
+  return tail.join('\n').trimEnd();
+}
 
 async function resetDir(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
@@ -379,7 +568,7 @@ async function spawnInitSession(runner: RunnerAdapter, repoRoot: string, configD
   await mkdir(configDir, { recursive: true });
   const configPath = join(configDir, 'cli-config.json');
   await writeJson(configPath, initCliConfig());
-  return await runner.spawn(repoRoot, {}, configDir);
+  return await runner.spawn(repoRoot, {}, configDir, { taskType: 'plan' });
 }
 
 function initCliConfig(): any {

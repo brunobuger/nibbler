@@ -29,6 +29,18 @@ export function parseEventLine(line: string): NibblerEvent | null {
         impact: typeof parsed.impact === 'string' ? parsed.impact : undefined
       };
     }
+    if (type === 'QUESTIONS') {
+      const qs = parsed.questions;
+      if (!Array.isArray(qs)) return null;
+      const questions = qs.filter((q) => typeof q === 'string').map((q) => q.trim()).filter(Boolean);
+      if (questions.length === 0) return null;
+      return { type, questions };
+    }
+    if (type === 'QUESTION') {
+      const text = typeof parsed.text === 'string' ? parsed.text.trim() : '';
+      if (!text) return null;
+      return { type, text };
+    }
     return null;
   } catch {
     return null;

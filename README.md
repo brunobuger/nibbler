@@ -107,6 +107,26 @@ Nibbler defaults to running `agent`. If your system uses a different binary, set
 export NIBBLER_CURSOR_BINARY=cursor
 ```
 
+### Choosing the default LLM model (plan vs execution)
+
+Nibbler can pick a default Cursor model **based on the task type**:
+
+- Planning tasks (discovery / contract planning / delegated role planning): `gpt-5.2-codex-xhigh`
+- Execution tasks (implementation): `gpt-5.2-high`
+
+Override via environment variables:
+
+```bash
+# Override all sessions
+export NIBBLER_CURSOR_MODEL="gpt-5.2-high"
+
+# Override just planning sessions
+export NIBBLER_CURSOR_MODEL_PLAN="gpt-5.2-codex-xhigh"
+
+# Override just execution sessions
+export NIBBLER_CURSOR_MODEL_EXECUTE="gpt-5.2-high"
+```
+
 ### “Working tree is not clean”
 
 For safety and traceability, `build/fix/resume` require a clean git working tree. Commit or stash your changes first.

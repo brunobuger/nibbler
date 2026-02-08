@@ -1,7 +1,9 @@
 export type NibblerEvent =
   | { type: 'PHASE_COMPLETE'; summary?: string }
   | { type: 'NEEDS_ESCALATION'; reason?: string; context?: unknown }
-  | { type: 'EXCEPTION'; reason?: string; impact?: string };
+  | { type: 'EXCEPTION'; reason?: string; impact?: string }
+  | { type: 'QUESTIONS'; questions: string[] }
+  | { type: 'QUESTION'; text: string };
 
 export interface RunnerCapabilities {
   interactive: boolean;

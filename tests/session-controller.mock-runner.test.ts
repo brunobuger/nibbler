@@ -46,7 +46,12 @@ class MockRunner implements RunnerAdapter {
     return { interactive: false, permissions: true, streamJson: false };
   }
 
-  async spawn(_workspacePath: string, _envVars: Record<string, string>, _configDir: string): Promise<SessionHandle> {
+  async spawn(
+    _workspacePath: string,
+    _envVars: Record<string, string>,
+    _configDir: string,
+    _options?: { mode?: 'normal' | 'plan'; interactive?: boolean }
+  ): Promise<SessionHandle> {
     const id = `h-${Math.random().toString(16).slice(2)}`;
     const now = new Date().toISOString();
     const handle: SessionHandle = { id, startedAtIso: now, lastActivityAtIso: now, pid: 1 };

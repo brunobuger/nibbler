@@ -10,7 +10,6 @@ import { CursorRunnerAdapter } from '../../core/session/cursor-adapter.js';
 import type { RunnerAdapter } from '../../core/session/runner.js';
 import { readContract } from '../../core/contract/reader.js';
 import type { Contract } from '../../core/contract/types.js';
-import { runDiscovery } from '../../discovery/engine.js';
 import { JobIdGenerator } from '../../utils/id.js';
 import { fileExists, readText } from '../../utils/fs.js';
 import { createBranch, getCurrentBranch, git, isClean } from '../../git/operations.js';
@@ -18,6 +17,8 @@ import { initJob, initWorkspace } from '../../workspace/layout.js';
 import type { JobState } from '../../core/job/types.js';
 import { getRenderer } from '../ui/renderer.js';
 import { theme } from '../ui/theme.js';
+import { roleLabel } from '../ui/format.js';
+import type { SpinnerHandle } from '../ui/spinner.js';
 import { installCliCancellation } from '../cancel.js';
 
 export interface BuildCommandOptions {
@@ -25,7 +26,6 @@ export interface BuildCommandOptions {
   requirement?: string;
   files?: string[];
   dryRun?: boolean;
-  skipDiscovery?: boolean;
   skipScaffold?: boolean;
   runner?: RunnerAdapter;
   startedAtIso?: string;
@@ -35,7 +35,7 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
   const r = getRenderer();
   const repoRoot = resolve(opts.repoRoot ?? process.cwd());
   const requirement = opts.requirement?.trim() || '';
-  const providedFiles = (opts.files ?? []).map((p) => resolve(p));
+  const _providedFiles = (opts.files ?? []).map((p) => resolve(p));
 
   const jobId = new JobIdGenerator().next(new Date());
 
@@ -49,6 +49,16 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
   if (!contract) return { ok: false, details: 'No contract found. Run `nibbler init` first.' };
   const gitignoreOk = await hasRequiredGitignore(repoRoot);
   if (!gitignoreOk) return { ok: false, details: 'Missing .gitignore entries. Run `nibbler init` (it writes required ignores).' };
+
+  // Discovery is now performed during `nibbler init`. Build requires these artifacts.
+  const hasVision = await fileExists(join(repoRoot, 'vision.md'));
+  const hasArchitecture = await fileExists(join(repoRoot, 'architecture.md'));
+  if (!hasVision || !hasArchitecture) {
+    return {
+      ok: false,
+      details: `Missing required artifacts: ${!hasVision ? 'vision.md ' : ''}${!hasArchitecture ? 'architecture.md' : ''}. Run \`nibbler init\` first.`,
+    };
+  }
 
   // ── Dry-run mode ─────────────────────────────────────────────────────────
   if (opts.dryRun) {
@@ -97,20 +107,23 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
   }
 
   // ── Engine hooks: orchestration + rendering ──────────────────────────────
-  const jm = new JobManager(sessions, gates, evidence, ledger, {
-    onPhaseEnter: async ({ phaseId, job: j }) => {
-      r.phaseBanner(phaseId);
+  // Keep a single live spinner for the currently active role attempt.
+  // This creates the “premium CLI” feel during long agent waits.
+  let activeRoleSpinner: SpinnerHandle | null = null;
+  let activeRoleId: string | null = null;
 
-      if (phaseId === 'discovery' && !opts.skipDiscovery) {
-        await runDiscovery({ workspace: repoRoot, providedFiles, planDir: jobPaths.planDir });
-        j.feedbackByRole ??= {};
-        j.feedbackByRole.architect = {
-          kind: 'discovery',
-          requirement,
-          providedFiles,
-          discoveryPlanPath: `.nibbler/jobs/${jobId}/plan/discovery.json`,
-        };
-      }
+  const stopActiveRoleSpinner = (roleId: string, ok: boolean) => {
+    if (!activeRoleSpinner || activeRoleId !== roleId) return;
+    const prefix = roleLabel(roleId);
+    if (ok) activeRoleSpinner.succeed(`${prefix}Session complete`);
+    else activeRoleSpinner.fail(`${prefix}Session needs revision`);
+    activeRoleSpinner = null;
+    activeRoleId = null;
+  };
+
+  const jm = new JobManager(sessions, gates, evidence, ledger, {
+    onPhaseEnter: async ({ phaseId }) => {
+      r.phaseBanner(phaseId);
     },
 
     beforeVerifyCompletion: async ({ job: j, roleId }) => {
@@ -122,11 +135,10 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
 
     // ── Rendering hooks ──────────────────────────────────────────────────
     onRoleStart: ({ roleId, attempt, maxAttempts }) => {
-      if (attempt === 1) {
-        r.roleWorking(roleId, `Starting session...`);
-      } else {
-        r.roleRetry(roleId, attempt, maxAttempts);
-      }
+      // If a previous spinner is still active (unexpected), stop it cleanly.
+      activeRoleSpinner?.stop();
+      activeRoleId = roleId;
+      activeRoleSpinner = r.spinner(`${roleLabel(roleId)}Starting session (attempt ${attempt}/${maxAttempts})...`);
     },
 
     onRoleComplete: ({ roleId, durationMs, diff }) => {
@@ -136,6 +148,8 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
     },
 
     onVerification: ({ roleId, scopePassed, completionPassed, scopeViolations, diff }) => {
+      stopActiveRoleSpinner(roleId, scopePassed && completionPassed);
+
       r.verificationStart(roleId);
       r.verificationResult(roleId, [
         {
@@ -162,6 +176,7 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
     },
 
     onEscalation: ({ roleId, reason }) => {
+      stopActiveRoleSpinner(roleId, false);
       r.roleEscalation(roleId, reason);
     },
 

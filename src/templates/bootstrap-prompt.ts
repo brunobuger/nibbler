@@ -44,12 +44,15 @@ export function renderInitBootstrapPrompt(ctx: InitBootstrapContext): string {
 
   // Explicit doc-reading instructions
   const docsToRead: string[] = [];
-  if (ctx.project.hasArchitectureMd) docsToRead.push('ARCHITECTURE.md (or architecture.md)');
   if (ctx.project.hasVisionMd) docsToRead.push('vision.md');
+  if (ctx.project.hasArchitectureMd) docsToRead.push('ARCHITECTURE.md (or architecture.md)');
   if (ctx.project.hasPrdMd) docsToRead.push('PRD.md (or prd.md)');
   if (docsToRead.length > 0) {
     lines.push('**IMPORTANT:** Read the following files BEFORE proposing the contract:');
     for (const d of docsToRead) lines.push(`  - ${d}`);
+    lines.push('');
+    lines.push('Treat `vision.md` and `architecture.md` as the durable source of truth.');
+    lines.push('If a PRD exists, use it to validate/reconcile (but do not ignore vision/architecture).');
     lines.push('These documents define the product, architecture, and tech stack. Use them to:');
     lines.push('  - Identify the project type (web-app, API, CLI, etc.)');
     lines.push('  - Identify technical traits (auth, database, realtime, etc.)');
