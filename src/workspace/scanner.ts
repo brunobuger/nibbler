@@ -1,7 +1,7 @@
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { fileExists, readText } from '../utils/fs.js';
+import { fileExists, readText, resolveDocVariant } from '../utils/fs.js';
 import { ingestMaterials } from '../discovery/ingestion.js';
 import { classifyProjectTypeDetailed } from '../discovery/classification.js';
 import { detectTraits } from '../discovery/traits.js';
@@ -13,6 +13,21 @@ export interface ProjectState {
   hasArchitectureMd: boolean;
   hasVisionMd: boolean;
   hasPrdMd: boolean;
+  /**
+   * Resolved doc filename (relative to repo root), preserving on-disk casing.
+   * Present only when the file exists.
+   */
+  architectureMdPath?: string;
+  /**
+   * Resolved doc filename (relative to repo root), preserving on-disk casing.
+   * Present only when the file exists.
+   */
+  visionMdPath?: string;
+  /**
+   * Resolved doc filename (relative to repo root), preserving on-disk casing.
+   * Present only when the file exists.
+   */
+  prdMdPath?: string;
   hasPackageJson: boolean;
   hasSrcDir: boolean;
   topLevelEntries: string[];
@@ -34,26 +49,28 @@ async function listDir(dir: string): Promise<string[]> {
 }
 
 /**
- * Case-insensitive check for a doc file. Returns true if any variant exists.
+ * Resolve the filename variant that exists (if any), preserving casing.
  */
-async function existsCaseInsensitive(repoRoot: string, variants: string[]): Promise<boolean> {
-  for (const v of variants) {
-    if (await fileExists(join(repoRoot, v))) return true;
-  }
-  return false;
+async function resolveExistingDoc(repoRoot: string, variants: string[], defaultName: string): Promise<{ exists: boolean; rel?: string }> {
+  const rel = await resolveDocVariant(repoRoot, variants, defaultName);
+  const exists = await fileExists(join(repoRoot, rel));
+  return { exists, rel: exists ? rel : undefined };
 }
 
 export async function scanProjectState(repoRoot: string): Promise<ProjectState> {
   const contractDir = join(repoRoot, '.nibbler', 'contract');
-  const [topLevelEntries, hasContract, hasArchitectureMd, hasVisionMd, hasPrdMd, hasPackageJson, hasSrcDir] = await Promise.all([
+  const [topLevelEntries, hasContract, arch, vision, prd, hasPackageJson, hasSrcDir] = await Promise.all([
     listDir(repoRoot),
     fileExists(contractDir),
-    existsCaseInsensitive(repoRoot, ['architecture.md', 'ARCHITECTURE.md', 'Architecture.md']),
-    existsCaseInsensitive(repoRoot, ['vision.md', 'VISION.md', 'Vision.md']),
-    existsCaseInsensitive(repoRoot, ['prd.md', 'PRD.md', 'Prd.md']),
+    resolveExistingDoc(repoRoot, ['architecture.md', 'ARCHITECTURE.md', 'Architecture.md'], 'architecture.md'),
+    resolveExistingDoc(repoRoot, ['vision.md', 'VISION.md', 'Vision.md'], 'vision.md'),
+    resolveExistingDoc(repoRoot, ['prd.md', 'PRD.md', 'Prd.md'], 'PRD.md'),
     fileExists(join(repoRoot, 'package.json')),
     fileExists(join(repoRoot, 'src'))
   ]);
+  const hasArchitectureMd = arch.exists;
+  const hasVisionMd = vision.exists;
+  const hasPrdMd = prd.exists;
 
   let packageJsonPreview: ProjectState['packageJsonPreview'];
   if (hasPackageJson) {
@@ -83,6 +100,9 @@ export async function scanProjectState(repoRoot: string): Promise<ProjectState> 
     hasArchitectureMd,
     hasVisionMd,
     hasPrdMd,
+    architectureMdPath: arch.rel,
+    visionMdPath: vision.rel,
+    prdMdPath: prd.rel,
     hasPackageJson,
     hasSrcDir,
     topLevelEntries,

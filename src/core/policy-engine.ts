@@ -100,23 +100,55 @@ export async function verifyCompletion(role: string, job: JobState, contract: Co
   };
 }
 
+function jobWorkspaceRoot(job: JobState): string {
+  // When a worktree is used, sessions and git operations run there, while evidence lives in repoRoot.
+  // Completion criteria should be evaluated against the session workspace first.
+  return job.worktreePath ?? job.repoRoot;
+}
+
+function jobSearchRoots(job: JobState): string[] {
+  const primary = jobWorkspaceRoot(job);
+  if (primary === job.repoRoot) return [primary];
+  return [primary, job.repoRoot];
+}
+
 async function evaluateCriterion(c: Criterion, job: JobState): Promise<CriterionResult> {
   switch (c.type) {
     case 'artifact_exists': {
       const pat = substituteTokens(c.pattern, { id: job.jobId });
-      const found = await globExists(job.repoRoot, pat);
-      return found
-        ? { passed: true, message: `artifact_exists(${pat})`, evidence: found }
-        : { passed: false, message: `artifact_exists(${pat}) not found` };
+      const roots: string[] = [];
+
+      // Planning artifacts are written under a job-local staging directory,
+      // then materialized into `.nibbler/jobs/<id>/plan/` before verification.
+      // Contracts often reference artifacts like `docs/plans/**` without the staging prefix,
+      // so we search those plan roots transparently during planning verification.
+      if (job.currentPhaseId === 'planning') {
+        const ws = jobWorkspaceRoot(job);
+        roots.push(join(ws, '.nibbler-staging', 'plan', job.jobId));
+        roots.push(join(job.repoRoot, '.nibbler', 'jobs', job.jobId, 'plan'));
+      }
+
+      roots.push(...jobSearchRoots(job));
+
+      // De-dup while preserving order.
+      const uniqRoots = Array.from(new Set(roots));
+
+      for (const root of uniqRoots) {
+        const found = await globExists(root, pat);
+        if (found) {
+          return { passed: true, message: `artifact_exists(${pat})`, evidence: found };
+        }
+      }
+      return { passed: false, message: `artifact_exists(${pat}) not found` };
     }
     case 'command_succeeds': {
-      const r = await runCommand(job.repoRoot, c.command);
+      const r = await runCommand(jobWorkspaceRoot(job), c.command);
       return r.exitCode === 0
         ? { passed: true, message: `command_succeeds`, evidence: r }
         : { passed: false, message: `command_succeeds failed (exit=${r.exitCode})`, evidence: r };
     }
     case 'command_fails': {
-      const r = await runCommand(job.repoRoot, c.command);
+      const r = await runCommand(jobWorkspaceRoot(job), c.command);
       return r.exitCode !== 0
         ? { passed: true, message: `command_fails`, evidence: r }
         : { passed: false, message: `command_fails expected non-zero`, evidence: r };
@@ -143,7 +175,7 @@ async function evaluateCriterion(c: Criterion, job: JobState): Promise<Criterion
           };
     }
     case 'custom': {
-      const r = await runCommand(job.repoRoot, c.script);
+      const r = await runCommand(jobWorkspaceRoot(job), c.script);
       return r.exitCode === 0
         ? { passed: true, message: `custom`, evidence: r }
         : { passed: false, message: `custom failed (exit=${r.exitCode})`, evidence: r };
@@ -176,10 +208,14 @@ async function runCommand(cwd: string, command: string): Promise<{ exitCode: num
 }
 
 async function globExists(repoRoot: string, pattern: string): Promise<string[] | null> {
-  const files = await listFilesRec(repoRoot, ['.git', 'node_modules']);
-  const isMatch = picomatch(pattern, { dot: true });
-  const matches = files.filter((p) => isMatch(p));
-  return matches.length ? matches : null;
+  try {
+    const files = await listFilesRec(repoRoot, ['.git', 'node_modules']);
+    const isMatch = picomatch(pattern, { dot: true });
+    const matches = files.filter((p) => isMatch(p));
+    return matches.length ? matches : null;
+  } catch {
+    return null;
+  }
 }
 
 async function listFilesRec(root: string, ignoreDirs: string[]): Promise<string[]> {

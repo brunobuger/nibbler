@@ -10,9 +10,10 @@ import { CursorRunnerAdapter } from '../../core/session/cursor-adapter.js';
 import type { RunnerAdapter } from '../../core/session/runner.js';
 import { readContract } from '../../core/contract/reader.js';
 import type { Contract } from '../../core/contract/types.js';
+import { pickFixStartPhase } from '../../core/contract/helpers.js';
 import { JobIdGenerator } from '../../utils/id.js';
-import { fileExists, readText } from '../../utils/fs.js';
-import { createBranch, getCurrentBranch, git, isClean } from '../../git/operations.js';
+import { fileExists, readText, resolveDocVariant } from '../../utils/fs.js';
+import { getCurrentBranch, git, isClean } from '../../git/operations.js';
 import { initJob, initWorkspace } from '../../workspace/layout.js';
 import type { JobState } from '../../core/job/types.js';
 import { getRenderer } from '../ui/renderer.js';
@@ -20,6 +21,12 @@ import { theme } from '../ui/theme.js';
 import { roleLabel } from '../ui/format.js';
 import type { SpinnerHandle } from '../ui/spinner.js';
 import { installCliCancellation } from '../cancel.js';
+import { cleanupJobWorktreeBestEffort, mergeBackIfSafe, prepareJobWorktree } from '../worktrees.js';
+import { listJobIds, readJobStatus, isPidAlive } from '../jobs.js';
+import { promptInput, promptSelect } from '../ui/prompts.js';
+import type { JobOutcome } from '../../core/job-manager.js';
+import { formatFailureForArchitect } from './recovery.js';
+import { runExistingJob } from './existing-job.js';
 
 export interface BuildCommandOptions {
   repoRoot?: string;
@@ -37,22 +44,28 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
   const requirement = opts.requirement?.trim() || '';
   const _providedFiles = (opts.files ?? []).map((p) => resolve(p));
 
-  const jobId = new JobIdGenerator().next(new Date());
+  const jobId = await allocateJobId(repoRoot, new Date());
 
   // ── Pre-flight checks ────────────────────────────────────────────────────
   const repo = git(repoRoot);
-  if (!(await isClean(repo))) {
+  if (!(await isClean(repo, { ignoreNibblerEngineArtifacts: true }))) {
     return { ok: false, details: 'Working tree is not clean. Commit/stash changes before running nibbler build.' };
   }
 
   const contract = await safeReadContract(join(repoRoot, '.nibbler', 'contract'));
-  if (!contract) return { ok: false, details: 'No contract found. Run `nibbler init` first.' };
+  if (!contract) {
+    return { ok: false, details: 'No contract found. Run `nibbler init` first.' };
+  }
   const gitignoreOk = await hasRequiredGitignore(repoRoot);
-  if (!gitignoreOk) return { ok: false, details: 'Missing .gitignore entries. Run `nibbler init` (it writes required ignores).' };
+  if (!gitignoreOk) {
+    return { ok: false, details: 'Missing .gitignore entries. Run `nibbler init` (it writes required ignores).' };
+  }
 
   // Discovery is now performed during `nibbler init`. Build requires these artifacts.
-  const hasVision = await fileExists(join(repoRoot, 'vision.md'));
-  const hasArchitecture = await fileExists(join(repoRoot, 'architecture.md'));
+  const visionRel = await resolveDocVariant(repoRoot, ['vision.md', 'VISION.md', 'Vision.md'], 'vision.md');
+  const architectureRel = await resolveDocVariant(repoRoot, ['architecture.md', 'ARCHITECTURE.md', 'Architecture.md'], 'architecture.md');
+  const hasVision = await fileExists(join(repoRoot, visionRel));
+  const hasArchitecture = await fileExists(join(repoRoot, architectureRel));
   if (!hasVision || !hasArchitecture) {
     return {
       ok: false,
@@ -67,10 +80,88 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
     return { ok: true, jobId, details: { dryRun: true } };
   }
 
+  // ── Stale job detection (resume-or-new) ─────────────────────────────────
+  const quiet = process.env.NIBBLER_QUIET === '1';
+  const inTest = process.env.VITEST != null || process.env.VITEST_WORKER_ID != null || process.env.NODE_ENV === 'test';
+  const promptsEnabled =
+    !quiet &&
+    !inTest &&
+    process.stdin.isTTY === true &&
+    process.stdout.isTTY === true &&
+    process.env.NIBBLER_TEST_AUTO_APPROVE !== '1' &&
+    process.env.NIBBLER_TEST_NO_PROMPTS !== '1';
+
+  if (!inTest) {
+    const latest = await findLatestRecoverableJobForBuild(repoRoot);
+    if (latest) {
+      const { jobId: lastJobId, status } = latest;
+      const state = String(status.state);
+      const phase = status.current_phase ?? 'unknown';
+      const role = status.current_role ?? null;
+      const completed = status.progress.roles_completed.length;
+      const total = completed + status.progress.roles_remaining.length;
+
+      const running = status.engine_pid && isPidAlive(status.engine_pid);
+
+      // Quiet mode: auto-resume the latest job (no prompts).
+      if (quiet) {
+        return await runExistingJob({
+          repoRoot,
+          jobId: lastJobId,
+          contract,
+          runner: opts.runner,
+          allowFailed: true,
+          afterOutcome: async ({ jm, job, contract }, out) => {
+            return await runWithRecovery({ jm, job, contract, initialOutcome: out });
+          },
+        });
+      }
+
+      if (promptsEnabled) {
+        const message =
+          `Previous job found: ${theme.bold(lastJobId)} (${theme.bold(state)})\n` +
+          `Phase: ${theme.bold(phase)}${role ? ` | Role: ${theme.bold(role)}` : ''} | ${completed}/${total} roles completed\n` +
+          (running ? `Engine: running (pid=${status.engine_pid})\n` : '') +
+          'How would you like to proceed?';
+
+        const choice = await promptSelect<'resume' | 'new'>({
+          message,
+          choices: [
+            { name: 'Resume the previous job', value: 'resume' },
+            { name: 'Start a new build', value: 'new' },
+          ],
+        });
+
+        if (choice === 'resume') {
+          return await runExistingJob({
+            repoRoot,
+            jobId: lastJobId,
+            contract,
+            runner: opts.runner,
+            allowFailed: true,
+            afterOutcome: async ({ jm, job, contract }, out) => {
+              return await runWithRecovery({ jm, job, contract, initialOutcome: out });
+            },
+          });
+        }
+      }
+    }
+  }
+
   // ── Set up job ───────────────────────────────────────────────────────────
-  const branchSpinner = r.spinner(`Creating branch nibbler/job-${jobId}...`);
-  await createBranch(repo, `nibbler/job-${jobId}`);
-  branchSpinner.succeed(`Branch nibbler/job-${jobId}`);
+  const jobBranch = `nibbler/job-${jobId}`;
+  const branchSpinner = r.spinner('Preparing job worktree...');
+  let sourceBranch = 'HEAD';
+  let worktreePath = '';
+  try {
+    const res = await prepareJobWorktree({ repoRoot, jobId, jobBranch });
+    sourceBranch = res.sourceBranch;
+    worktreePath = res.worktreePath;
+    branchSpinner.succeed(`Worktree ready: ${theme.bold(jobBranch)} (base: ${theme.bold(sourceBranch)})`);
+  } catch (err: any) {
+    branchSpinner.fail('Failed to prepare job worktree');
+    return { ok: false, details: `Failed to prepare worktree for job. ${String(err?.message ?? err)}` };
+  }
 
   await initWorkspace(repoRoot);
   const jobPaths = await initJob(repoRoot, jobId);
@@ -86,7 +177,7 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
   const gates = new GateController(ledger, evidence);
 
   const runner = opts.runner ?? new CursorRunnerAdapter();
-  const sessions = new SessionController(runner, repoRoot, { inactivityTimeoutMs: 120_000 });
+  const sessions = new SessionController(runner, worktreePath, { inactivityTimeoutMs: 120_000 });
 
   const jobStartTime = Date.now();
   const job: JobState = {
@@ -95,6 +186,9 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
     mode: 'build' as const,
     description: requirement,
     currentPhaseId: contract.phases[0]?.id ?? 'start',
+    worktreePath,
+    sourceBranch,
+    jobBranch,
     startedAtIso: opts.startedAtIso ?? process.env.NIBBLER_TEST_STARTED_AT_ISO ?? new Date().toISOString(),
     enginePid: process.pid,
     globalBudgetLimitMs: contract.globalLifetime.maxTimeMs,
@@ -128,8 +222,21 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
 
     beforeVerifyCompletion: async ({ job: j, roleId }) => {
       if (j.currentPhaseId === 'planning' && roleId === 'architect') {
-        const staged = join(repoRoot, '.nibbler-staging', 'plan', jobId);
+        const staged = join(worktreePath, '.nibbler-staging', 'plan', jobId);
         await copyDirIfExists(staged, jobPaths.planDir);
+
+        // Planning contracts often require staged contract snapshots; ensure they exist.
+        // If the Architect already wrote staged contract files, keep them as-is.
+        const stagedContractDir = join(worktreePath, '.nibbler-staging', 'contract');
+        await mkdir(stagedContractDir, { recursive: true });
+        const stagedTeam = join(stagedContractDir, 'team.yaml');
+        const stagedPhases = join(stagedContractDir, 'phases.yaml');
+        if (!(await fileExists(stagedTeam))) {
+          await copyFile(join(worktreePath, '.nibbler', 'contract', 'team.yaml'), stagedTeam);
+        }
+        if (!(await fileExists(stagedPhases))) {
+          await copyFile(join(worktreePath, '.nibbler', 'contract', 'phases.yaml'), stagedPhases);
+        }
       }
     },
 
@@ -193,8 +300,38 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
     },
   });
   try {
-    const out = await jm.runContractJob(job, contract);
+    let out = await jm.runContractJob(job, contract);
+    out = await runWithRecovery({ jm, job, contract, initialOutcome: out });
     if (out.ok) {
+      const mergeSpinner = r.spinner(`Merging ${theme.bold(jobBranch)} into ${theme.bold(sourceBranch)}...`);
+      try {
+        const merged = await mergeBackIfSafe({ repoRoot, sourceBranch, jobBranch, allowNoFf: true });
+        if (!merged.merged) {
+          mergeSpinner.fail('Auto-merge skipped');
+          r.warn(`Job completed on ${theme.bold(jobBranch)} but was not merged automatically (${merged.reason}).`);
+          r.warn(`Worktree preserved at: ${theme.bold(worktreePath)}`);
+          return { ok: false, jobId, details: `Auto-merge skipped (${merged.reason}). Merge ${jobBranch} manually.` };
+        }
+        mergeSpinner.succeed(`Merged into ${theme.bold(sourceBranch)}`);
+      } catch {
+        mergeSpinner.fail('Merge failed');
+        r.warn(`Job completed on ${theme.bold(jobBranch)} but could not be merged automatically.`);
+        r.warn(`Worktree preserved at: ${theme.bold(worktreePath)}`);
+        return { ok: false, jobId, details: `Merge failed. Resolve conflicts and merge ${jobBranch} manually.` };
+      }
+
+      const cleanupSpinner = r.spinner('Cleaning up worktree...');
+      try {
+        const cleaned = await cleanupJobWorktreeBestEffort({ repoRoot, worktreePath, jobBranch });
+        cleanupSpinner.succeed('Worktree cleaned up');
+        if (!cleaned.removedWorktree || !cleaned.deletedBranch) {
+          r.warn(`Cleanup incomplete. Worktree: ${theme.bold(worktreePath)} branch: ${theme.bold(jobBranch)}`);
+        }
+      } catch {
+        cleanupSpinner.fail('Cleanup incomplete');
+        r.warn(`Cleanup incomplete. Worktree: ${theme.bold(worktreePath)} branch: ${theme.bold(jobBranch)}`);
+      }
+
       // ── Completion summary ───────────────────────────────────────────────
       const durationMs = Date.now() - jobStartTime;
       const branch = await getCurrentBranch(repo).catch(() => `nibbler/job-${jobId}`);
@@ -213,9 +350,96 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
       });
       return { ok: true, jobId };
     }
+    // Failure: preserve worktree and branch for inspection.
+    r.warn(`Job failed. Worktree preserved at: ${theme.bold(worktreePath)}`);
+    r.warn(`Branch: ${theme.bold(jobBranch)}`);
     return { ok: false, jobId, details: out };
   } finally {
     cancellation.dispose();
+  }
+}
+
+async function runWithRecovery(args: {
+  jm: JobManager;
+  job: JobState;
+  contract: Contract;
+  initialOutcome: JobOutcome;
+}): Promise<JobOutcome> {
+  let out = args.initialOutcome;
+  if (out.ok) return out;
+  if (out.reason === 'cancelled') return out;
+
+  const r = getRenderer();
+  const quiet = process.env.NIBBLER_QUIET === '1';
+  const inTest = process.env.VITEST != null || process.env.VITEST_WORKER_ID != null || process.env.NODE_ENV === 'test';
+  const promptsEnabled =
+    !quiet &&
+    !inTest &&
+    process.stdin.isTTY === true &&
+    process.stdout.isTTY === true &&
+    process.env.NIBBLER_TEST_AUTO_APPROVE !== '1' &&
+    process.env.NIBBLER_TEST_NO_PROMPTS !== '1';
+  const MAX_RECOVERY_ATTEMPTS = 2;
+
+  let guidance: string | null = null;
+  for (let attempt = 1; attempt <= MAX_RECOVERY_ATTEMPTS; attempt++) {
+    r.phaseBanner('Recovery (autonomous)');
+    r.warn(`Build failed (${String(out.reason)}). Architect agent is reviewing...`);
+
+    args.jm.resetForRecovery();
+    args.job.mode = 'fix';
+    args.job.state = 'executing';
+    args.job.feedbackByRole ??= {};
+    (args.job.feedbackByRole as any).architect = {
+      kind: 'fix',
+      issue: formatFailureForArchitect(out, args.job),
+      ...(guidance ? { userGuidance: guidance } : {}),
+    };
+
+    out = await args.jm.runContractJobFromPhase(args.job, args.contract, pickFixStartPhase(args.contract));
+    if (out.ok) return out;
+    if (out.reason === 'cancelled') return out;
+
+    // Tier 2: user prompt as last resort.
+    if (!promptsEnabled) return out;
+    if (attempt >= MAX_RECOVERY_ATTEMPTS) return out;
+
+    r.blank();
+    r.warn('Autonomous recovery did not resolve the failure.');
+    r.dim(`Evidence: .nibbler/jobs/${args.job.jobId}/evidence/`);
+
+    const action = await promptSelect<'retry' | 'abort'>({
+      message: 'How would you like to proceed?',
+      choices: [
+        { name: 'Provide guidance and retry', value: 'retry' },
+        { name: 'Abort (preserve worktree for manual inspection)', value: 'abort' },
+      ],
+    });
+    if (action === 'abort') return out;
+
+    guidance = await promptInput({
+      message: 'Guidance for the Architect (what should be changed / where to look):',
+    });
+  }
+
+  return out;
+}
+
+async function findLatestRecoverableJobForBuild(
+  repoRoot: string
+): Promise<{ jobId: string; status: Awaited<ReturnType<typeof readJobStatus>> } | null> {
+  const ids = await listJobIds(repoRoot);
+  if (!ids.length) return null;
+
+  const jobId = ids[ids.length - 1]!;
+  try {
+    const status = await readJobStatus(repoRoot, jobId);
+    const state = String(status.state);
+    if (state === 'completed') return null;
+    if (state === 'cancelled') return null;
+    return { jobId, status };
+  } catch {
+    return null;
   }
 }
 
@@ -270,7 +494,8 @@ async function hasRequiredGitignore(repoRoot: string): Promise<boolean> {
 }
 
 async function copyDirIfExists(fromDir: string, toDir: string): Promise<void> {
-  if (!(await existsDir(fromDir))) return;
+  const exists = await existsDir(fromDir);
+  if (!exists) return;
   await mkdir(toDir, { recursive: true });
   await copyDir(fromDir, toDir);
 }
@@ -305,4 +530,33 @@ async function safeReadContract(contractDir: string): Promise<Contract | null> {
   } catch {
     return null;
   }
+}
+
+async function allocateJobId(repoRoot: string, now: Date): Promise<string> {
+  const yyyyMMdd = (() => {
+    const yyyy = now.getUTCFullYear();
+    const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(now.getUTCDate()).padStart(2, '0');
+    return `${yyyy}${mm}${dd}`;
+  })();
+
+  const jobsDir = join(repoRoot, '.nibbler', 'jobs');
+  let maxSeq = 0;
+
+  try {
+    const entries = await readdir(jobsDir, { withFileTypes: true });
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const m = new RegExp(`^j-${yyyyMMdd}-(\\d{3})$`).exec(e.name);
+      if (!m) continue;
+      const n = Number(m[1]);
+      if (Number.isFinite(n)) maxSeq = Math.max(maxSeq, n);
+    }
+  } catch {
+    // ignore: repo may not have .nibbler/jobs yet
+  }
+
+  const jobId = new JobIdGenerator().next(now);
+  const chosen = maxSeq > 0 ? `j-${yyyyMMdd}-${String(maxSeq + 1).padStart(3, '0')}` : jobId;
+  return chosen;
 }

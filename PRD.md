@@ -24,7 +24,7 @@ Nibbler looks simple but is deeply intelligent. It consumes messy inputs (rough 
 
 **Constitutional governance.** Nibbler ships with a small, stable set of meta-rules (the "constitution") that guarantee structural properties. Everything else — roles, phases, verification methods, artifact formats — is contract-level, proposed by the Architect, and validated against the constitution.
 
-**Sequential execution, single branch.** All work happens on one local git branch, one role at a time. No worktrees, no merge strategies, no concurrency complexity. Scope enforcement is post-hoc: let the agent work, then verify the diff.
+**Sequential execution, per-job worktree.** All work happens one role at a time, but each job runs inside its own **git worktree** on a job branch (e.g. `nibbler/job-<id>` or `nibbler/fix-<id>`). The user's working directory and current branch are not modified during execution. Scope enforcement is post-hoc: let the agent work, then verify the diff. On success, Nibbler merges the job branch back into the user's original branch (only when safe) and cleans up the worktree; on failure, it preserves the worktree + branch for inspection/manual merge.
 
 ---
 
@@ -455,19 +455,22 @@ The PO is only involved if the Architect determines the issue is a product decis
 
 ## 7. Workspace & Sandbox Model
 
-### 7.1. Single Branch, Sequential Execution
+### 7.1. Worktree-Based Job Isolation (Sequential Execution)
 
-All work happens on a single local git branch (`nibbler/job-<id>`), one role at a time. There are no worktrees, no parallel sessions, no merge strategies.
+All work happens one role at a time, but each job executes in a dedicated **git worktree** and job branch. This avoids disrupting the user's working directory (no branch switching, no resets/cleans in the user's worktree).
 
 The execution sequence:
 
-1. Engine creates branch from current HEAD
-2. Engine sets up `.nibbler/jobs/<id>/` folder structure
-3. For each role in delegation order:
+1. Engine records the user's current branch as `source_branch`
+2. Engine creates a job branch at current HEAD (`nibbler/job-<id>` or `nibbler/fix-<id>`)
+3. Engine creates a worktree for the job branch (one worktree per job)
+4. Engine sets up `.nibbler/jobs/<id>/` folder structure (evidence, ledger, status) in the main repo directory
+5. For each role in delegation order:
    - Swap rules overlay and permissions
-   - Run session
+   - Run session inside the job worktree
    - Verify and commit (or reject and loop)
-4. Final branch contains the linear history of all role contributions
+6. If the job completes successfully, the engine merges the job branch back into `source_branch` **only if** the user's current branch still matches `source_branch` and the working tree is clean; then it removes the worktree and deletes the job branch (best-effort).
+7. If the job fails (or merge is skipped/fails), the engine preserves the worktree + job branch for inspection/manual merge.
 
 ### 7.2. Scope Enforcement (Post-Hoc)
 
@@ -481,7 +484,7 @@ Since all roles share the same workspace, scope enforcement is based on diff ana
 
 ### 7.3. What Persists Across Sessions
 
-- The repo workspace (single directory, single branch)
+- The job worktree workspace (single directory per job, single job branch)
 - All committed files from previous sessions
 - Base cursor rules (`00-nibbler-protocol.mdc`, etc.)
 - The `.nibbler/` job folder (evidence, ledger, plan artifacts)
@@ -696,7 +699,7 @@ During any phase, agents may need additional context:
   - `--file <path>` — Provide input documents (PRD, specs, etc.). Multiple allowed.
   - `--dry-run` — Run through discovery and planning, show what would be executed, without running any role sessions.
 
-- **`nibbler fix "<issue>"`** — Run a targeted fix job on the existing codebase.
+Build is the single entrypoint: on failure, the engine performs autonomous recovery (Architect-first) and prompts the user only as a last resort.
 
 - **`nibbler status [job-id]`** — Show current phase, active role, last events, progress.
 

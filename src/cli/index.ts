@@ -6,7 +6,6 @@ import { fileURLToPath } from 'node:url';
 
 import { runInitCommand } from './commands/init.js';
 import { runBuildCommand } from './commands/build.js';
-import { runFixCommand } from './commands/fix.js';
 import { runStatusCommand } from './commands/status.js';
 import { runListCommand } from './commands/list.js';
 import { runHistoryCommand } from './commands/history.js';
@@ -94,7 +93,7 @@ export function buildCli(argv: string[]) {
         const r = getRenderer();
         r.error(
           'Build failed',
-          String(res.details ?? 'unknown error'),
+          formatUnknown(res.details ?? 'unknown error'),
           'Check the evidence directory for details, or run with --verbose.',
         );
         process.exitCode = 1;
@@ -103,36 +102,6 @@ export function buildCli(argv: string[]) {
       if (!globalFlags.quiet) {
         const r = getRenderer();
         r.success(`Build complete: job ${res.jobId}`);
-      }
-    });
-
-  program
-    .command('fix')
-    .description('Run a targeted fix job')
-    .argument('<issue>', 'Issue description')
-    .option('--file <path>', 'Supporting document (repeatable)', collectRepeatable, [])
-    .option('--scope <role>', "Limit fix to a specific role's scope")
-    .action(async (issue: string, opts: { file: string[]; scope?: string }) => {
-      const res = await runFixCommand({ issue, files: opts.file ?? [], scopeRole: opts.scope });
-      if (!res.ok) {
-        if ((res.details as any)?.reason === 'cancelled') {
-          const r = getRenderer();
-          r.warn('Cancelled.');
-          process.exitCode = 130;
-          return;
-        }
-        const r = getRenderer();
-        r.error(
-          'Fix failed',
-          String(res.details ?? 'unknown error'),
-          'Check the evidence directory for details, or run with --verbose.',
-        );
-        process.exitCode = 1;
-        return;
-      }
-      if (!globalFlags.quiet) {
-        const r = getRenderer();
-        r.success(`Fix complete: job ${res.jobId}`);
       }
     });
 
@@ -204,6 +173,15 @@ export function buildCli(argv: string[]) {
 }
 
 buildCli(process.argv);
+
+function formatUnknown(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
 
 function detectVersionSync(): string | null {
   try {

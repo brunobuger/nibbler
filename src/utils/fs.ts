@@ -1,5 +1,5 @@
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import YAML from 'yaml';
 
 export async function ensureDir(path: string): Promise<void> {
@@ -13,6 +13,19 @@ export async function fileExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Resolve a document filename variant that exists on disk.
+ *
+ * This is intentionally simple (no directory scanning): it tries `variants` in order
+ * and returns the first match. If none exist, returns `defaultName`.
+ */
+export async function resolveDocVariant(dir: string, variants: string[], defaultName: string): Promise<string> {
+  for (const v of variants) {
+    if (await fileExists(join(dir, v))) return v;
+  }
+  return defaultName;
 }
 
 export async function readText(path: string): Promise<string> {

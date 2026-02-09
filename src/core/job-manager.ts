@@ -62,6 +62,17 @@ export class JobManager {
   ) {}
 
   /**
+   * Allow re-running orchestration on the same JobManager instance after a previous run
+   * finalized (job_failed/job_completed/etc).
+   *
+   * Used by build-level recovery flows that intentionally retry after failure.
+   */
+  resetForRecovery(): void {
+    this.finalized = false;
+    this.cancelInfo = null;
+  }
+
+  /**
    * Best-effort cancellation entrypoint for SIGINT/SIGTERM.
    * Captures evidence and writes `job_cancelled` to the ledger.
    */
@@ -136,7 +147,7 @@ export class JobManager {
       let firstPhase = true;
 
       while (true) {
-        if (job.state === 'cancelled') {
+        if (this.cancelInfo) {
           const out: JobOutcome = { ok: false, reason: 'cancelled', details: { info: this.cancelInfo } };
           await this.finalizeForOutcome(job, out);
           return out;
@@ -211,7 +222,14 @@ export class JobManager {
           job.currentRoleId = roleId;
           await this.persist(job);
 
-          const res = await this.runRoleSession(roleId, job, contract);
+          const delegatedTasks = (job.delegationPlan?.tasks ?? [])
+            .filter((t) => t.roleId === roleId)
+            .slice()
+            .sort((a, b) => (a.priority ?? 9_999) - (b.priority ?? 9_999));
+
+          const res = await this.runRoleSession(roleId, job, contract, {
+            delegatedTasks: delegatedTasks.length > 0 ? delegatedTasks : undefined
+          });
           if (!res.ok) {
             await this.finalizeForOutcome(job, res);
             return res;
@@ -349,7 +367,7 @@ export class JobManager {
         return { ok: false, reason: 'budget_exceeded', details: globalBudget };
       }
 
-      const repo = git(job.repoRoot);
+      const repo = git(jobWorkspaceRoot(job));
       const attemptStart = Date.now();
 
       const preSessionCommit = await getCurrentCommit(repo);
@@ -397,6 +415,35 @@ export class JobManager {
         attempt
       });
 
+      const planningBootstrapPrompt =
+        roleId === 'architect' && job.currentPhaseId === 'planning'
+          ? [
+              'You are in the PLANNING phase.',
+              '',
+              'IMPORTANT: Do NOT implement or scaffold the product yet. Do NOT modify repo files outside planning artifacts.',
+              '',
+              `Write planning artifacts ONLY under: .nibbler-staging/plan/${job.jobId}/`,
+              '',
+              'Required artifact: delegation.yaml (STRICT YAML, schema below). The engine will copy it into .nibbler/jobs/<id>/plan/ before verification.',
+              '',
+              'delegation.yaml schema (example):',
+              'version: 1',
+              'tasks:',
+              '  - taskId: t1',
+              '    roleId: frontend',
+              '    description: "Scaffold Next.js app + basic routes"',
+              '    scopeHints: ["src/app/**", "package.json"]',
+              '    priority: 1',
+              '',
+              'Notes:',
+              '- tasks[].scopeHints must stay within the role scope (or shared scope) from `.nibbler/contract/team.yaml`.',
+              '- Quote any YAML string values that start with punctuation (e.g. backticks).',
+              '',
+              'When finished, emit:',
+              'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"planning artifacts written"}'
+            ].join('\n')
+          : undefined;
+
       const handle = await this.sessionController.startSession(roleId, job, effectiveContract, {
         mode: 'implement',
         delegatedTasks: options.delegatedTasks,
@@ -407,7 +454,7 @@ export class JobManager {
               '',
               'Follow the plan closely. If you hit a blocker, emit NEEDS_ESCALATION.',
             ].join('\n')
-          : undefined
+          : planningBootstrapPrompt
       });
       this.activeHandle = handle;
       job.sessionHandleId = handle.id;
@@ -661,7 +708,21 @@ export class JobManager {
       job.feedbackByRole.architect = {
         kind: 'delegation_missing',
         path: rel,
-        message: 'Planning must produce delegation.yaml so execution can be delegation-driven.'
+        message:
+          'Planning must produce delegation.yaml so execution can be delegation-driven. ' +
+          `Write it to: .nibbler-staging/plan/${job.jobId}/delegation.yaml (engine will materialize it). ` +
+          'Schema: version: 1; tasks: [{ taskId, roleId, description, scopeHints, dependsOn?, priority? }]. ' +
+          'YAML tip: quote any string values that start with punctuation (e.g. backticks).',
+        example: [
+          'version: 1',
+          'tasks:',
+          '  - taskId: t1',
+          '    roleId: frontend',
+          '    description: "Scaffold Next.js app + basic routes"',
+          '    scopeHints: ["src/app/**", "package.json"]',
+          '    priority: 1',
+          '',
+        ].join('\n'),
       };
       await this.persist(job);
       return { passed: false, message: `delegation plan missing (${rel})`, evidence: { evidencePath } };
@@ -686,7 +747,10 @@ export class JobManager {
         job.feedbackByRole.architect = {
           kind: 'delegation_validation_failed',
           path: rel,
-          errors
+          errors,
+          message:
+            'Delegation plan is valid YAML but does not match required schema/constraints. ' +
+            'Expected: version + tasks[] with taskId/roleId/description/scopeHints.',
         };
         await this.persist(job);
         return { passed: false, message: 'delegation plan invalid', evidence: { evidencePath, errors } };
@@ -708,8 +772,20 @@ export class JobManager {
       job.feedbackByRole.architect = {
         kind: 'delegation_parse_failed',
         path: rel,
-        message: 'Delegation plan must be valid YAML matching the required schema.',
-        error: String(err?.message ?? err)
+        message:
+          'Delegation plan must be valid YAML matching the required schema. ' +
+          'Tip: if a YAML value starts with punctuation (like a backtick), wrap it in quotes.',
+        error: String(err?.message ?? err),
+        example: [
+          'version: 1',
+          'tasks:',
+          '  - taskId: t1',
+          '    roleId: backend',
+          '    description: "Add RLS policy: `auth.uid() = user_id`"',
+          '    scopeHints: ["supabase/migrations/**"]',
+          '    priority: 1',
+          '',
+        ].join('\n'),
       };
       await this.persist(job);
       return { passed: false, message: `delegation plan parse failed`, evidence: { evidencePath } };
@@ -739,13 +815,20 @@ export class JobManager {
         notes?: string;
       }
   > {
-    const repo = git(job.repoRoot);
+    const repo = git(jobWorkspaceRoot(job));
     const pre = await getCurrentCommit(repo);
 
     const decisionRel = `.nibbler-staging/${job.jobId}/scope-exception-decision.json`;
-    const decisionAbs = `${job.repoRoot.replace(/\/+$/, '')}/${decisionRel}`;
+    const decisionAbs = `${jobWorkspaceRoot(job).replace(/\/+$/, '')}/${decisionRel}`;
     const proposalEvidenceRel = `.nibbler/jobs/${job.jobId}/evidence/checks/scope-exception-proposal.json`;
     const effectiveEvidenceRel = `.nibbler/jobs/${job.jobId}/evidence/checks/scope-exception-effective.json`;
+
+    // Ensure the decision directory exists (helps the Architect).
+    try {
+      await mkdir(dirname(decisionAbs), { recursive: true });
+    } catch {
+      // ignore
+    }
 
     // Provide the request to the Architect via feedback (rendered into overlay).
     job.feedbackByRole ??= {};
@@ -803,13 +886,61 @@ export class JobManager {
       })
     };
 
-    // Run a single Architect session to produce the decision file.
-    const handle = await this.sessionController.startSession('architect', job, restrictedContract);
-    this.activeHandle = handle;
+    const prevRoleId = job.currentRoleId;
+    const prevSessionLogPath = job.sessionLogPath;
+
+    job.currentRoleId = 'architect';
+    job.sessionActive = true;
+    job.sessionStartedAtIso = new Date().toISOString();
+    job.sessionHandleId = null;
+    job.sessionPid = null;
+    job.sessionLastActivityAtIso = null;
+    job.sessionLogPath = `.nibbler/jobs/${job.jobId}/evidence/sessions/architect-scope-exception-${req.failedRoleId}-${job.currentPhaseId}-${req.attempt}.log`;
     await this.persist(job);
+
+    const decisionBootstrapPrompt = [
+      'You are the Architect. The engine requires a scope-exception decision for a worker role.',
+      '',
+      `Write a JSON decision file at: ${decisionRel}`,
+      '',
+      'Allowed decisions:',
+      '- deny',
+      '- grant_narrow_access',
+      '- reroute_work',
+      '- terminate',
+      '',
+      'If granting access, include:',
+      '- kind: "shared_scope" (preferred) or "extra_scope"',
+      '- patterns: string[] of narrow path globs to allow',
+      '- optional: ownerRoleId, expiresAfterAttempt, notes',
+      '',
+      'Example:',
+      '{"decision":"grant_narrow_access","kind":"shared_scope","patterns":[".gitignore","next-env.d.ts"],"notes":"Next.js scaffolding requires these root files."}',
+      '',
+      'When finished, emit:',
+      'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"scope exception decision written"}',
+      '',
+    ].join('\n');
+
+    // Run a single Architect session to produce the decision file.
+    const handle = await this.sessionController.startSession('architect', job, restrictedContract, {
+      bootstrapPrompt: decisionBootstrapPrompt
+    });
+    this.activeHandle = handle;
+    job.sessionHandleId = handle.id;
+    job.sessionPid = handle.pid ?? null;
+    job.sessionLastActivityAtIso = handle.lastActivityAtIso ?? null;
+    await this.persist(job);
+
     await this.sessionController.waitForCompletion(handle, mustRole(contract, 'architect').budget);
     await this.sessionController.stopSession(handle);
     this.activeHandle = null;
+
+    job.sessionActive = false;
+    job.sessionLastActivityAtIso = handle.lastActivityAtIso ?? job.sessionLastActivityAtIso ?? null;
+    job.currentRoleId = prevRoleId;
+    job.sessionLogPath = prevSessionLogPath;
+    await this.persist(job);
 
     // Enforce: Architect decision must not modify non-engine paths.
     const dAll = await diff(repo, pre);
@@ -974,7 +1105,7 @@ export class JobManager {
     if (this.finalized) return;
     this.finalized = true;
 
-    const repo = git(job.repoRoot);
+    const repo = git(jobWorkspaceRoot(job));
     const [branch, commitHash, files] = await Promise.all([
       getCurrentBranch(repo).catch(() => null),
       getCurrentCommit(repo).catch(() => null),
@@ -1002,11 +1133,11 @@ export class JobManager {
     contract: Contract,
     req: { attempt: number; delegatedTasks: DelegationTask[] }
   ): Promise<{ ok: true; implPlanRel: string } | { ok: false; details: unknown }> {
-    const repo = git(job.repoRoot);
+    const repo = git(jobWorkspaceRoot(job));
     const pre = await getCurrentCommit(repo);
 
     const stagedRel = `.nibbler-staging/${job.jobId}/plans/${roleId}-plan.md`;
-    const stagedAbs = `${job.repoRoot.replace(/\/+$/, '')}/${stagedRel}`;
+    const stagedAbs = `${jobWorkspaceRoot(job).replace(/\/+$/, '')}/${stagedRel}`;
     const implPlanRel = `.nibbler/jobs/${job.jobId}/plan/${roleId}-impl-plan.md`;
     const implPlanAbs = `${job.repoRoot.replace(/\/+$/, '')}/${implPlanRel}`;
 
@@ -1084,11 +1215,11 @@ export class JobManager {
       implementationPlanRel: string | null;
     }
   ): Promise<{ ok: boolean; resolutionRel?: string; notes?: string }> {
-    const repo = git(job.repoRoot);
+    const repo = git(jobWorkspaceRoot(job));
     const pre = await getCurrentCommit(repo);
 
     const resolutionStagedRel = `.nibbler-staging/${job.jobId}/resolutions/${req.failedRoleId}.md`;
-    const resolutionStagedAbs = `${job.repoRoot.replace(/\/+$/, '')}/${resolutionStagedRel}`;
+    const resolutionStagedAbs = `${jobWorkspaceRoot(job).replace(/\/+$/, '')}/${resolutionStagedRel}`;
 
     const resolutionRel = `.nibbler/jobs/${job.jobId}/plan/resolutions/${req.failedRoleId}.md`;
     const resolutionAbs = `${job.repoRoot.replace(/\/+$/, '')}/${resolutionRel}`;
@@ -1281,5 +1412,9 @@ function findStartPhaseId(contract: Contract): string | null {
   }
   const starts = contract.phases.map((p) => p.id).filter((id) => (indegree.get(id) ?? 0) === 0);
   return starts.length ? starts[0] : null;
+}
+
+function jobWorkspaceRoot(job: JobState): string {
+  return job.worktreePath ?? job.repoRoot;
 }
 

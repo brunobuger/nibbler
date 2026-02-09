@@ -56,6 +56,7 @@ export function buildEffectiveSharedScopes(contract: Contract, job: JobState, op
   const base = contract.sharedScopes ?? [];
   const overrides = job.scopeOverridesByRole ?? {};
   const out: SharedScopeDeclaration[] = [...base];
+  const validRoleIds = new Set(contract.roles.map((r) => r.id));
 
   for (const [roleId, items] of Object.entries(overrides)) {
     const attempt = opts.attemptByRole[roleId] ?? 1;
@@ -64,7 +65,12 @@ export function buildEffectiveSharedScopes(contract: Contract, job: JobState, op
       if (o.phaseId !== opts.phaseId) continue;
       if (o.expiresAfterAttempt !== undefined && attempt > o.expiresAfterAttempt) continue;
 
-      const owner = o.ownerRoleId ?? 'architect';
+      let owner = o.ownerRoleId ?? 'architect';
+      if (!validRoleIds.has(owner)) owner = 'architect';
+      if (owner === roleId) {
+        // If the Architect decision set `ownerRoleId` to the same role, still grant access by sharing with Architect.
+        owner = 'architect';
+      }
       if (owner === roleId) continue;
       out.push({
         roles: [roleId, owner],
@@ -82,14 +88,51 @@ export function buildEffectiveContractForSession(
   roleId: string,
   opts: { phaseId: string; attempt: number }
 ): Contract {
-  const roles = contract.roles.map((r) => (r.id === roleId ? buildEffectiveRoleDefinition(r, job, { phaseId: opts.phaseId, attempt: opts.attempt }) : r));
+  const nextLike = isNextJsLikeContract(contract);
+  const roles = contract.roles.map((r) => {
+    const effective = r.id === roleId ? buildEffectiveRoleDefinition(r, job, { phaseId: opts.phaseId, attempt: opts.attempt }) : r;
+    return applyEngineDefaultRoleScope(effective, { nextLike });
+  });
   const attemptByRole: Record<string, number> = {};
   for (const r of contract.roles) attemptByRole[r.id] = job.attemptsByRole?.[r.id] ?? (r.id === roleId ? opts.attempt : 1);
 
   return {
     ...contract,
     roles,
-    sharedScopes: buildEffectiveSharedScopes(contract, job, { phaseId: opts.phaseId, attemptByRole }),
+    sharedScopes: applyEngineDefaultSharedScopes(
+      buildEffectiveSharedScopes(contract, job, { phaseId: opts.phaseId, attemptByRole }),
+      contract
+    ),
   };
+}
+
+function applyEngineDefaultRoleScope(role: RoleDefinition, opts: { nextLike: boolean }): RoleDefinition {
+  // Next.js scaffolding commonly generates `next-env.d.ts` at repo root.
+  if (opts.nextLike && role.id === 'frontend' && !role.scope.includes('next-env.d.ts')) {
+    return { ...role, scope: [...role.scope, 'next-env.d.ts'] };
+  }
+  return role;
+}
+
+function applyEngineDefaultSharedScopes(sharedScopes: SharedScopeDeclaration[], contract: Contract): SharedScopeDeclaration[] {
+  // `.gitignore` is a common repo-hygiene file needed during scaffolding. Treat it as globally shared.
+  const hasGitignore = sharedScopes.some((s) => (s.patterns ?? []).includes('.gitignore'));
+  if (hasGitignore) return sharedScopes;
+
+  const roleIds = contract.roles.map((r) => r.id);
+  return [
+    ...sharedScopes,
+    {
+      roles: roleIds,
+      patterns: ['.gitignore']
+    }
+  ];
+}
+
+function isNextJsLikeContract(contract: Contract): boolean {
+  const pats: string[] = [];
+  for (const r of contract.roles) pats.push(...(r.scope ?? []));
+  for (const s of contract.sharedScopes ?? []) pats.push(...(s.patterns ?? []));
+  return pats.some((p) => p === 'next.config.*' || p.startsWith('next.config.'));
 }
 

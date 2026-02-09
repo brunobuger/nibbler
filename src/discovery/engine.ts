@@ -22,6 +22,11 @@ export interface DiscoveryRunOptions {
   roundTimeoutMs?: number;
   projectState?: ProjectState;
   classification?: ProjectClassification | null;
+  /**
+   * When true, discovery runs even if artifacts already exist.
+   * Useful for remediation when docs exist but are low quality/stale.
+   */
+  force?: boolean;
 }
 
 export interface DiscoveryResult {
@@ -64,10 +69,14 @@ export async function runDiscovery(opts: DiscoveryRunOptions): Promise<Discovery
   await mkdir(planDir, { recursive: true });
   await writeDiscoveryPlan(discoveryPlanPath, { project, classification, providedFiles, context, qna });
 
+  // Preserve on-disk casing if the repo already has these docs.
+  const outputVisionRel = project.visionMdPath ?? 'vision.md';
+  const outputArchitectureRel = project.architectureMdPath ?? 'architecture.md';
+
   // If the repo already has both artifacts, consider discovery complete.
-  const visionAbs = join(workspace, 'vision.md');
-  const archAbs = join(workspace, 'architecture.md');
-  if (await fileExists(visionAbs) && await fileExists(archAbs)) {
+  const visionAbs = join(workspace, outputVisionRel);
+  const archAbs = join(workspace, outputArchitectureRel);
+  if (!opts.force && (await fileExists(visionAbs)) && (await fileExists(archAbs))) {
     return { context, qna, wroteVision: true, wroteArchitecture: true, discoveryPlanPath };
   }
 
@@ -128,7 +137,7 @@ export async function runDiscovery(opts: DiscoveryRunOptions): Promise<Discovery
   const wroteArchitecture = await fileExists(archAbs);
   if (!wroteVision || !wroteArchitecture) {
     throw new Error(
-      `Discovery did not produce required artifacts: ${!wroteVision ? 'vision.md ' : ''}${!wroteArchitecture ? 'architecture.md' : ''}`.trim()
+      `Discovery did not produce required artifacts: ${!wroteVision ? `${outputVisionRel} ` : ''}${!wroteArchitecture ? outputArchitectureRel : ''}`.trim()
     );
   }
 
@@ -151,10 +160,13 @@ async function runInteractiveDiscoverySession(args: {
 }): Promise<void> {
   const { workspace, runner, project, classification, context, providedFiles, qna, maxRounds, maxPerRound, roundTimeoutMs, sessionLogPath, verbose } = args;
 
+  const outputVisionRel = project.visionMdPath ?? 'vision.md';
+  const outputArchitectureRel = project.architectureMdPath ?? 'architecture.md';
+
   // Prepare a dedicated config dir for discovery (tight write scope).
   const configDir = join(workspace, '.nibbler', 'config', 'cursor-profiles', 'discovery');
   await mkdir(configDir, { recursive: true });
-  await writeJson(join(configDir, 'cli-config.json'), discoveryCliConfig());
+  await writeJson(join(configDir, 'cli-config.json'), discoveryCliConfig(outputVisionRel, outputArchitectureRel));
 
   // Ensure planDir/session log parent exists for Cursor adapter log writing.
   await mkdir(join(sessionLogPath, '..'), { recursive: true });
@@ -167,7 +179,9 @@ async function runInteractiveDiscoverySession(args: {
     ingested: context,
     providedFiles,
     priorQnA: qna,
-    maxQuestionsPerRound: maxPerRound
+    maxQuestionsPerRound: maxPerRound,
+    outputVisionPathRel: outputVisionRel,
+    outputArchitecturePathRel: outputArchitectureRel
   });
   await writeRoleOverlay(workspace, 'architect', prompt);
 
@@ -207,7 +221,7 @@ async function runInteractiveDiscoverySession(args: {
 
         const qs = ev.questions.slice(0, maxPerRound);
         await collectAnswers(qs, qna);
-        await runner.send(handle, formatAnswersMessage(qs, qna));
+        await runner.send(handle, formatAnswersMessage(qs, qna, outputVisionRel, outputArchitectureRel));
         continue;
       }
 
@@ -217,7 +231,7 @@ async function runInteractiveDiscoverySession(args: {
 
         const qs = [ev.text].slice(0, maxPerRound);
         await collectAnswers(qs, qna);
-        await runner.send(handle, formatAnswersMessage(qs, qna));
+        await runner.send(handle, formatAnswersMessage(qs, qna, outputVisionRel, outputArchitectureRel));
         continue;
       }
 
@@ -249,9 +263,12 @@ async function runOneShotDiscoveryRound(args: {
 }): Promise<NibblerEvent | null> {
   const { workspace, runner, project, classification, context, providedFiles, qna, maxPerRound, round, roundTimeoutMs, sessionLogPath, verbose } = args;
 
+  const outputVisionRel = project.visionMdPath ?? 'vision.md';
+  const outputArchitectureRel = project.architectureMdPath ?? 'architecture.md';
+
   const configDir = join(workspace, '.nibbler', 'config', 'cursor-profiles', 'discovery');
   await mkdir(configDir, { recursive: true });
-  await writeJson(join(configDir, 'cli-config.json'), discoveryCliConfig());
+  await writeJson(join(configDir, 'cli-config.json'), discoveryCliConfig(outputVisionRel, outputArchitectureRel));
 
   await mkdir(join(sessionLogPath, '..'), { recursive: true });
 
@@ -263,7 +280,9 @@ async function runOneShotDiscoveryRound(args: {
     ingested: context,
     providedFiles,
     priorQnA: qna,
-    maxQuestionsPerRound: maxPerRound
+    maxQuestionsPerRound: maxPerRound,
+    outputVisionPathRel: outputVisionRel,
+    outputArchitecturePathRel: outputArchitectureRel
   });
   await writeRoleOverlay(workspace, 'architect', prompt);
 
@@ -306,7 +325,12 @@ async function collectAnswers(questions: string[], qna: Array<{ question: string
   }
 }
 
-function formatAnswersMessage(justAsked: string[], qna: Array<{ question: string; answer: string }>): string {
+function formatAnswersMessage(
+  justAsked: string[],
+  qna: Array<{ question: string; answer: string }>,
+  outputVisionRel: string,
+  outputArchitectureRel: string
+): string {
   const answers = justAsked.map((q) => {
     const last = [...qna].reverse().find((qa) => qa.question === q);
     return { question: q, answer: last?.answer ?? '' };
@@ -321,16 +345,23 @@ function formatAnswersMessage(justAsked: string[], qna: Array<{ question: string
     lines.push('');
   }
   lines.push('```');
-  lines.push('Continue discovery. If more input is needed, emit another QUESTIONS event. Otherwise, write vision.md and architecture.md and emit PHASE_COMPLETE.');
+  lines.push(
+    `Continue discovery. If more input is needed, emit another QUESTIONS event. Otherwise, write ${outputVisionRel} and ${outputArchitectureRel} and emit PHASE_COMPLETE.`
+  );
   return lines.join('\n');
 }
 
-function discoveryCliConfig(): any {
+function discoveryCliConfig(outputVisionRel: string, outputArchitectureRel: string): any {
   return {
     version: 1,
     editor: { vimMode: false },
     permissions: {
-      allow: ['Read(**/*)', 'Write(vision.md)', 'Write(architecture.md)', 'Write(.nibbler-staging/**)'],
+      allow: [
+        'Read(**/*)',
+        `Write(${outputVisionRel})`,
+        `Write(${outputArchitectureRel})`,
+        'Write(.nibbler-staging/**)'
+      ],
       deny: ['Write(.nibbler/**)', 'Write(.cursor/**)', 'Read(.env*)', 'Read(**/.env*)', 'Write(**/*.key)']
     }
   };

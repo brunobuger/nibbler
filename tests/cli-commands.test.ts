@@ -1,12 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { execa } from 'execa';
 
 import { createTempGitRepo } from './git-fixture.js';
 import { MockRunnerAdapter } from './mock-runner.js';
 import { runBuildCommand } from '../src/cli/commands/build.js';
-import { runFixCommand } from '../src/cli/commands/fix.js';
 import { runStatusCommand } from '../src/cli/commands/status.js';
 import { runHistoryCommand } from '../src/cli/commands/history.js';
 import { runResumeCommand } from '../src/cli/commands/resume.js';
@@ -95,7 +94,7 @@ describe('CLI commands (mocked runner)', () => {
 
     const runner = new MockRunnerAdapter({
       architect: async ({ workspacePath }) => {
-        const jobsDir = join(workspacePath, '.nibbler', 'jobs');
+        const jobsDir = join(repoRoot, '.nibbler', 'jobs');
         const entries = await (await import('node:fs/promises')).readdir(jobsDir);
         const jobId = entries.find((e) => e.startsWith('j-'))!;
         const staged = join(workspacePath, '.nibbler-staging', 'plan', jobId);
@@ -115,7 +114,7 @@ tasks:
         );
       },
       worker: async ({ workspacePath, mode }) => {
-        const jobsDir = join(workspacePath, '.nibbler', 'jobs');
+        const jobsDir = join(repoRoot, '.nibbler', 'jobs');
         const entries = await (await import('node:fs/promises')).readdir(jobsDir);
         const jobId = entries.find((e) => e.startsWith('j-'))!;
         if (mode === 'plan') {
@@ -142,58 +141,6 @@ tasks:
       const history = await captureStderr(() => runHistoryCommand({ repoRoot }));
       expect(history.result.ok).toBe(true);
       expect(history.out).toContain(jobId);
-    } finally {
-      delete process.env.NIBBLER_TEST_AUTO_APPROVE;
-    }
-  });
-
-  it('fix runs starting from planning and materializes staged plan artifacts', async () => {
-    const { dir: repoRoot } = await createTempGitRepo();
-    await setupMinimalContract(repoRoot);
-
-    const runner = new MockRunnerAdapter({
-      architect: async ({ workspacePath }) => {
-        const jobsDir = join(workspacePath, '.nibbler', 'jobs');
-        const entries = await (await import('node:fs/promises')).readdir(jobsDir);
-        const jobId = entries.find((e) => e.startsWith('j-'))!;
-        const staged = join(workspacePath, '.nibbler-staging', 'plan', jobId);
-        await mkdir(staged, { recursive: true });
-        await writeFile(join(staged, 'acceptance.md'), '# acceptance\n', 'utf8');
-        await writeFile(
-          join(staged, 'delegation.yaml'),
-          `version: 1
-tasks:
-  - taskId: t1
-    roleId: worker
-    description: implement fix
-    scopeHints: ["src/**"]
-    priority: 1
-`,
-          'utf8'
-        );
-      },
-      worker: async ({ workspacePath, mode }) => {
-        const jobsDir = join(workspacePath, '.nibbler', 'jobs');
-        const entries = await (await import('node:fs/promises')).readdir(jobsDir);
-        const jobId = entries.find((e) => e.startsWith('j-'))!;
-        if (mode === 'plan') {
-          const planDir = join(workspacePath, '.nibbler-staging', jobId, 'plans');
-          await mkdir(planDir, { recursive: true });
-          await writeFile(join(planDir, 'worker-plan.md'), '# worker plan\n', 'utf8');
-          return;
-        }
-        await mkdir(join(workspacePath, 'src'), { recursive: true });
-        await writeFile(join(workspacePath, 'src', 'fix.ts'), 'export const fixed = true;\n', 'utf8');
-      }
-    });
-
-    process.env.NIBBLER_TEST_AUTO_APPROVE = '1';
-    try {
-      const res = await runFixCommand({ repoRoot, runner, issue: 'bug', files: [] });
-      expect(res.ok).toBe(true);
-      const jobId = res.jobId!;
-      const plan = await readFile(join(repoRoot, '.nibbler', 'jobs', jobId, 'plan', 'acceptance.md'), 'utf8');
-      expect(plan).toContain('acceptance');
     } finally {
       delete process.env.NIBBLER_TEST_AUTO_APPROVE;
     }

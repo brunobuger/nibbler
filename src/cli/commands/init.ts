@@ -17,6 +17,8 @@ import { renderInitBootstrapPrompt } from '../../templates/bootstrap-prompt.js';
 import { commit, git, isClean } from '../../git/operations.js';
 import { exampleContracts } from '../../templates/contract-examples/index.js';
 import { runDiscovery } from '../../discovery/engine.js';
+import { validateArtifacts, type ArtifactQualityReport } from '../../discovery/artifact-validator.js';
+import { runArtifactImprovement } from '../../discovery/artifact-improvement.js';
 import { getRenderer } from '../ui/renderer.js';
 import { theme } from '../ui/theme.js';
 import { formatMs } from '../ui/format.js';
@@ -162,6 +164,114 @@ export async function runInitCommand(opts: InitCommandOptions = {}): Promise<{ o
       }
     }
 
+    // ── Step 3.5: Artifact quality validation (structural heuristics) ────────
+    let artifactQualityReports: ArtifactQualityReport[] = await validateArtifacts(repoRoot, project, {
+      requireVision: true,
+      requireArchitecture: true,
+      requirePrd: false,
+    });
+
+    if (artifactQualityReports.some((r) => r.issues.length > 0)) {
+      r.artifactQualityReport(artifactQualityReports);
+    }
+
+    let insufficient = artifactQualityReports.filter((r) => r.score === 'insufficient');
+    if (insufficient.length > 0) {
+      const canRediscover = !opts.skipDiscovery;
+      const decision = await getArtifactQualityDecision({ canRediscover });
+
+      if (decision === 'abort') {
+        return {
+          ok: false,
+          errors: `Input artifacts are insufficient. Fix ${insufficient.map((x) => x.file).join(', ')} and re-run \`nibbler init\`.`,
+        };
+      }
+
+      if (decision === 'rediscover') {
+        const discSpinner = r.spinner('Re-running discovery to improve artifacts...');
+        const discDir = join(repoRoot, '.nibbler-staging', 'discovery');
+        await resetDir(discDir);
+        const start = Date.now();
+        try {
+          await runDiscovery({
+            workspace: repoRoot,
+            providedFiles: (opts.files ?? []).map((p) => resolve(p)),
+            planDir: discDir,
+            runner,
+            projectState: project,
+            classification: null,
+            force: true,
+          });
+          discSpinner.succeed(`Discovery complete ${theme.dim(`(${formatMs(Date.now() - start)})`)}`);
+          project = await scanProjectState(repoRoot);
+        } catch (err: any) {
+          discSpinner.fail(`Discovery failed ${theme.dim(`(${formatMs(Date.now() - start)})`)}`);
+          const msg = String(err?.message ?? err);
+          return { ok: false, errors: msg };
+        }
+
+        artifactQualityReports = await validateArtifacts(repoRoot, project, {
+          requireVision: true,
+          requireArchitecture: true,
+          requirePrd: false,
+        });
+        if (artifactQualityReports.some((r) => r.issues.length > 0)) {
+          r.artifactQualityReport(artifactQualityReports);
+        }
+        insufficient = artifactQualityReports.filter((r) => r.score === 'insufficient');
+        if (insufficient.length > 0) {
+          // Discovery only rewrites vision + architecture. If other artifacts (e.g. PRD.md) remain insufficient,
+          // generate *proposed* improvements into staging and ask the user to approve applying them.
+          const improveSpinner = r.spinner('Proposing improvements for insufficient artifacts...');
+          const improveDir = join(repoRoot, '.nibbler-staging', 'artifact-improvements');
+          await resetDir(improveDir);
+          try {
+            const sessionLogPath = join(repoRoot, '.nibbler-staging', 'discovery', 'sessions', 'artifact-improve.log');
+            const { proposed } = await runArtifactImprovement({
+              workspace: repoRoot,
+              runner,
+              project,
+              reports: insufficient,
+              outputDirAbs: improveDir,
+              sessionLogPath,
+              timeoutMs: 600_000,
+            });
+            improveSpinner.succeed('Improvement proposals ready');
+
+            if (proposed.length > 0) {
+              await maybeApplyArtifactProposals({ repoRoot, proposals: proposed, renderer: r });
+              project = await scanProjectState(repoRoot);
+              artifactQualityReports = await validateArtifacts(repoRoot, project, {
+                requireVision: true,
+                requireArchitecture: true,
+                requirePrd: false,
+              });
+              if (artifactQualityReports.some((x) => x.issues.length > 0)) {
+                r.artifactQualityReport(artifactQualityReports);
+              }
+              insufficient = artifactQualityReports.filter((x) => x.score === 'insufficient');
+            } else {
+              r.warn('No improvement proposals were produced.');
+            }
+          } catch (err: any) {
+            improveSpinner.fail('Failed to generate improvement proposals');
+            const msg = String(err?.message ?? err);
+            r.warn(msg);
+          }
+
+          if (insufficient.length > 0) {
+            const followup = await getArtifactQualityDecision({ canRediscover: false });
+            if (followup === 'abort') {
+              return {
+                ok: false,
+                errors: `Input artifacts are still insufficient. Fix ${insufficient.map((x) => x.file).join(', ')} and re-run \`nibbler init\`.`,
+              };
+            }
+          }
+        }
+      }
+    }
+
     // ── Step 4: Generate Contract via Architect ──────────────────────────────
     const stagingDir = join(repoRoot, '.nibbler-staging', 'contract');
     await resetDir(stagingDir);
@@ -197,6 +307,7 @@ export async function runInitCommand(opts: InitCommandOptions = {}): Promise<{ o
         existingContractYaml,
         exampleContracts: Array.from(exampleContracts),
         contractStagingDir: stagingDir.replaceAll('\\', '/'),
+        artifactQualitySummary: formatArtifactQualitySummary(artifactQualityReports),
       }).concat(renderFeedback(feedbackBlocks));
 
       if (isVerbose()) {
@@ -292,7 +403,7 @@ export async function runInitCommand(opts: InitCommandOptions = {}): Promise<{ o
       await writeContract(join(repoRoot, '.nibbler', 'contract'), proposed);
       await writeProjectProfile(repoRoot, project);
       await generateAllProfiles(repoRoot, proposed);
-      await commit(git(repoRoot), '[nibbler] init: contract established');
+      await commit(git(repoRoot), '[nibbler] init: contract established', { includeEngineArtifacts: true });
       commitSpinner.succeed('Contract committed');
     } else {
       r.dim('Dry run: no contract written or committed.');
@@ -497,6 +608,105 @@ function defaultProtocolRule(): string {
     '```',
     '',
   ].join('\n');
+}
+
+function formatArtifactQualitySummary(reports: ArtifactQualityReport[]): string {
+  const lines: string[] = [];
+  for (const r of reports) {
+    const issues = r.issues ?? [];
+    lines.push(`${r.file}: ${r.score}${issues.length ? ` (${issues.length} issue${issues.length === 1 ? '' : 's'})` : ''}`);
+    for (const i of issues) {
+      lines.push(`- [${i.severity}] ${i.message}`);
+    }
+    lines.push('');
+  }
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  return lines.join('\n');
+}
+
+async function getArtifactQualityDecision(args: { canRediscover: boolean }): Promise<'rediscover' | 'continue' | 'abort'> {
+  const forced = process.env.NIBBLER_TEST_ARTIFACT_QUALITY_DECISION?.trim();
+  if (forced === 'continue' || forced === 'abort') return forced;
+  if (forced === 'rediscover' && args.canRediscover) return 'rediscover';
+
+  // Non-interactive / tests: default to continue to preserve prior behavior.
+  if (
+    process.env.NIBBLER_TEST_AUTO_APPROVE === '1' ||
+    process.env.NIBBLER_TEST_NO_PROMPTS === '1' ||
+    process.env.NIBBLER_QUIET === '1' ||
+    process.stdin.isTTY !== true ||
+    process.stdout.isTTY !== true
+  ) {
+    return 'continue';
+  }
+
+  const choices: Array<{ name: string; value: 'rediscover' | 'continue' | 'abort' }> = [];
+  if (args.canRediscover) choices.push({ name: 'Re-run discovery to improve artifacts', value: 'rediscover' });
+  choices.push({ name: 'Continue anyway (contract quality may suffer)', value: 'continue' });
+  choices.push({ name: 'Abort and fix manually', value: 'abort' });
+
+  return await promptSelect<'rediscover' | 'continue' | 'abort'>({
+    message: 'Some input artifacts are insufficient. How would you like to proceed?',
+    choices,
+  });
+}
+
+function promptsEnabled(): boolean {
+  if (process.env.NIBBLER_TEST_AUTO_APPROVE === '1') return false;
+  if (process.env.NIBBLER_TEST_NO_PROMPTS === '1') return false;
+  if (process.env.NIBBLER_QUIET === '1') return false;
+  return process.stdin.isTTY === true && process.stdout.isTTY === true;
+}
+
+async function maybeApplyArtifactProposals(args: {
+  repoRoot: string;
+  proposals: Array<{ targetRel: string; proposedAbs: string }>;
+  renderer: ReturnType<typeof getRenderer>;
+}): Promise<void> {
+  const { repoRoot, proposals, renderer: r } = args;
+
+  const autoApply = process.env.NIBBLER_TEST_ARTIFACT_APPLY === '1';
+  for (const p of proposals) {
+    const proposed = await readText(p.proposedAbs);
+    const targetAbs = join(repoRoot, p.targetRel);
+    const current = (await fileExists(targetAbs)) ? await readText(targetAbs) : '';
+
+    if (proposed.trim() === current.trim()) {
+      r.dim(`No changes proposed for ${theme.bold(p.targetRel)} (already up to date).`);
+      continue;
+    }
+
+    // Small preview: first ~25 lines of the proposal.
+    const previewLines = proposed.split('\n').slice(0, 25).join('\n').trimEnd();
+    r.blank();
+    r.info(`Proposed update for ${theme.bold(p.targetRel)} (preview):`);
+    for (const line of previewLines.split('\n')) r.dim(`  ${line}`);
+    if (proposed.split('\n').length > 25) r.dim('  ...');
+    r.blank();
+
+    let apply = autoApply;
+    if (!apply) {
+      if (!promptsEnabled()) {
+        r.warn(`Non-interactive mode: skipping apply for ${p.targetRel}. Set NIBBLER_TEST_ARTIFACT_APPLY=1 to auto-apply in tests.`);
+        continue;
+      }
+      const decision = await promptSelect<'apply' | 'skip'>({
+        message: `Apply proposed update to ${p.targetRel}?`,
+        choices: [
+          { name: 'Apply', value: 'apply' },
+          { name: 'Skip', value: 'skip' },
+        ],
+      });
+      apply = decision === 'apply';
+    }
+
+    if (apply) {
+      await writeText(targetAbs, proposed);
+      r.success(`Updated ${p.targetRel}`);
+    } else {
+      r.warn(`Skipped updating ${p.targetRel}`);
+    }
+  }
 }
 
 async function getInitDecision(): Promise<'approve' | 'reject'> {

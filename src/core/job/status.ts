@@ -9,6 +9,11 @@ export const JobStatusSnapshotV1Schema = z.object({
   mode: z.custom<JobMode>().optional(),
   description: z.string().optional(),
 
+  // Worktree-based job isolation (optional; present for jobs created by newer engines).
+  worktree_path: z.string().min(1).nullable().optional(),
+  source_branch: z.string().min(1).nullable().optional(),
+  job_branch: z.string().min(1).nullable().optional(),
+
   state: z.custom<JobStatus>(),
   current_phase: z.string().nullable(),
   current_phase_actor_index: z.number().int().nonnegative().nullable().optional(),
@@ -83,6 +88,9 @@ export function buildJobStatusSnapshotV1(job: JobState): JobStatusSnapshotV1 {
     repo_root: job.repoRoot,
     mode: job.mode,
     description: job.description,
+    worktree_path: job.worktreePath ?? null,
+    source_branch: job.sourceBranch ?? null,
+    job_branch: job.jobBranch ?? null,
     state: (job.state ?? 'created') as JobStatus,
     current_phase: job.currentPhaseId ?? null,
     current_phase_actor_index: job.currentPhaseActorIndex ?? null,

@@ -2,6 +2,7 @@ import chalk from 'chalk';
 
 import type { GateDefinition } from '../../core/contract/types.js';
 import type { GateResolution } from '../../core/gate/types.js';
+import type { ArtifactQualityReport } from '../../discovery/artifact-validator.js';
 import { theme, INDENT, RULE_WIDTH, ROLE_LABEL_WIDTH } from './theme.js';
 import {
   formatMs,
@@ -34,6 +35,7 @@ export interface Renderer {
   welcome(version: string): void;
   initExplanation(): void;
   workspaceScan(info: Parameters<typeof workspaceSummary>[0]): void;
+  artifactQualityReport(reports: ArtifactQualityReport[]): void;
   contractSummary(contract: Parameters<typeof contractSummary>[0], filePaths?: string[]): void;
 
   // ── Phase / Workflow ──
@@ -111,6 +113,29 @@ export class InteractiveRenderer implements Renderer {
 
   workspaceScan(info: Parameters<typeof workspaceSummary>[0]): void {
     this.writeln(workspaceSummary(info));
+    this.writeln();
+  }
+
+  artifactQualityReport(reports: ArtifactQualityReport[]): void {
+    const lines: string[] = [];
+    for (const r of reports) {
+      const badge =
+        r.score === 'good'
+          ? theme.success('GOOD')
+          : r.score === 'needs-improvement'
+            ? theme.warning('NEEDS_IMPROVEMENT')
+            : theme.error('INSUFFICIENT');
+      lines.push(`${theme.bold(r.file)}: ${badge}`);
+      for (const issue of r.issues) {
+        const tag = issue.severity === 'error' ? theme.error('error') : theme.warning('warn');
+        lines.push(`  - ${tag} ${issue.message}`);
+      }
+      lines.push('');
+    }
+    // Trim trailing blanks for nicer boxes.
+    while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+    const box = drawBox('Artifact Quality', lines.length > 0 ? lines : ['(no data)'], RULE_WIDTH);
+    this.writeln(box);
     this.writeln();
   }
 
@@ -358,6 +383,10 @@ export class QuietRenderer implements Renderer {
 
   workspaceScan(info: Parameters<typeof workspaceSummary>[0]): void {
     this.emit('workspace_scan', { ...info });
+  }
+
+  artifactQualityReport(reports: ArtifactQualityReport[]): void {
+    this.emit('artifact_quality', { reports });
   }
 
   contractSummary(contract: Parameters<typeof contractSummary>[0]): void {

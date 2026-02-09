@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "job_id": "j-repro-attach",
+  "repo_root": "/home/buger/workspace/nibbler/.tmp-attach-repro",
+  "mode": "build",
+  "description": "attach repro",
+  "worktree_path": null,
+  "source_branch": "master",
+  "job_branch": "nibbler/job-j-repro-attach",
+  "state": "budget_exceeded",
+  "current_phase": null,
+  "current_role": null,
+  "session_active": false,
+  "engine_pid": 2211046,
+  "session": null,
+  "started_at": "2026-02-08T22:55:49.195Z",
+  "updated_at": "2026-02-08T22:55:49.195Z",
+  "budget": {
+    "global": {
+      "limit_ms": 1000,
+      "elapsed_ms": 1000
+    }
+  },
+  "progress": {
+    "roles_completed": [],
+    "roles_remaining": []
+  }
+}

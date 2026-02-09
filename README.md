@@ -35,11 +35,7 @@ nibbler init
 nibbler build "Implement feature X"
 ```
 
-3) Run a targeted fix using existing `vision.md` + `architecture.md`:
-
-```bash
-nibbler fix "Bug: login redirect loop"
-```
+If the build fails, `nibbler build` will guide recovery (autonomous Architect retry first, user prompt as last resort).
 
 ## Commands
 
@@ -58,13 +54,6 @@ Runs a full job (contract-defined phase graph).
 - `--dry-run`: prints execution plan only (no sessions)
 - `--skip-discovery`: skip running discovery engine hooks
 - `--skip-scaffold`: reserved for future scaffold logic
-
-### `nibbler fix "<issue>" [options]`
-
-Runs a targeted fix job.
-
-- `--file <path>`: supporting documents (repeatable). Copied into `.nibbler-staging/fix-inputs/<job-id>/` so agents can read them.
-- `--scope <role>`: limit execution phases to a single role (when that role is present in a phase’s actor list)
 
 ### `nibbler status [job-id] [options]`
 
@@ -129,7 +118,7 @@ export NIBBLER_CURSOR_MODEL_EXECUTE="gpt-5.2-high"
 
 ### “Working tree is not clean”
 
-For safety and traceability, `build/fix/resume` require a clean git working tree. Commit or stash your changes first.
+For safety and traceability, `build/resume` require a clean git working tree. Commit or stash your changes first.
 
 ### Ledger integrity warnings
 

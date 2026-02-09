@@ -38,9 +38,11 @@ No metadata database. No artifact tracking index. The file system is the single 
 
 Nibbler does not attempt to prevent scope violations or bad behavior during a session. Instead, it lets the agent work freely, then verifies the results after the session completes. Post-hoc enforcement via `git diff` analysis is simpler, more reliable, and more debuggable than pre-emptive filesystem isolation.
 
-### 1.5. Sequential Execution, Single Branch
+### 1.5. Sequential Execution, Worktree-Isolated Jobs
 
-All work happens on one local git branch, one role session at a time. No worktrees, no parallel sessions, no merge strategies. Each role commits directly to the branch. The next role picks up where the previous one left off. Complexity lives in the intelligence layer (context injection, contract design), not the infrastructure layer (workspace management).
+All work happens one role session at a time, but jobs run inside a dedicated **git worktree** on a job branch. This keeps the user's working directory and active branch stable during orchestration (no checkout/reset/clean in the user's worktree), while retaining the simplicity of sequential execution and post-hoc enforcement.
+
+Each role commits directly to the job branch in the job worktree. On successful completion, Nibbler merges the job branch back into the user's original branch (only when safe) and cleans up the worktree; on failure, it preserves the worktree + branch for inspection/manual merge.
 
 ---
 
@@ -83,7 +85,7 @@ All work happens on one local git branch, one role session at a time. No worktre
 
 ### 2.2. Component Responsibilities
 
-**Nibbler CLI** — Entry point. Parses commands (`init`, `build`, `fix`, `status`, `list`, `history`, `resume`), initializes the Job Manager, handles top-level error reporting and signal handling.
+**Nibbler CLI** — Entry point. Parses commands (`init`, `build`, `status`, `list`, `history`, `resume`), initializes the Job Manager, handles top-level error reporting and signal handling.
 
 **Job Manager** — The orchestration core. Maintains the job state machine, drives phase transitions, coordinates all other components. Owns the main loop: prepare session → launch session → collect evidence → verify → transition or loop.
 
@@ -864,17 +866,24 @@ The discovery phase handles three scenarios for `architecture.md`:
 ### 9.1. Branch Strategy
 
 ```
-main (or current HEAD)
-  └── nibbler/job-<id>          ← all work happens here
-        ├── commit: scaffold     (if needed)
-        ├── commit: sdet phase
-        ├── commit: backend phase
-        ├── commit: frontend phase
-        ├── commit: refactor phase (if applicable)
-        └── (linear history, one commit per role completion)
+source_branch (user's current branch)
+  ├── (unchanged during job execution)
+  └── merge-back (on success, when safe)
+        ▲
+        │
+        └── nibbler/job-<id> or nibbler/fix-<id>   ← work happens here (in a worktree)
+              ├── commit: <role1> complete
+              ├── commit: <role2> complete
+              └── (linear history, one commit per role completion)
 ```
 
-The branch is created at job start and contains a linear history. Each role's verified work is a single commit (or a squashed set if the role required multiple iterations).
+The job branch is created at job start (at current HEAD) and contains a linear history. Each role's verified work is a single commit (or a squashed set if the role required multiple iterations).
+
+Jobs run in a dedicated worktree located next to the repo (stable + discoverable):
+
+`<repoParent>/.nibbler-wt-<repoBasename>/<jobId>/`
+
+Engine state and evidence stay under the main repo root in `.nibbler/jobs/<id>/...` (gitignored), while code changes happen in the worktree.
 
 ### 9.2. Pre-Session / Post-Session State
 
@@ -1363,7 +1372,6 @@ nibbler <command> [options] [arguments]
 Commands:
   init                    Generate or review the project governance contract
   build <requirement>     Run a full job: discovery → plan → execute → ship
-  fix <issue>             Run a targeted fix job
   status [job-id]         Show job status
   list                    List active jobs
   history                 List completed jobs
@@ -1390,16 +1398,6 @@ Options:
   --dry-run         Run discovery and planning only, show execution plan
   --skip-discovery  Skip discovery (use existing vision.md)
   --skip-scaffold   Skip scaffolding even if repo appears empty
-```
-
-**`nibbler fix <issue> [options]`**
-```
-Arguments:
-  issue             Natural language description of the issue to fix
-
-Options:
-  --file <path>     Supporting documents. Repeatable.
-  --scope <role>    Limit fix to a specific role's scope
 ```
 
 **`nibbler status [job-id]`**

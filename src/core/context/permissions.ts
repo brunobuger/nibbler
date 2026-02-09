@@ -48,8 +48,21 @@ export function generatePermissionsConfig(roleDef: RoleDefinition, _contract: Co
   const deny: string[] = [
     writeToken('.nibbler/**'),
     writeToken('.cursor/rules/**'),
-    readToken('.env*'),
-    readToken('**/.env*'),
+    // Block reading real env files (may contain secrets), but allow `.env.example`.
+    readToken('.env'),
+    readToken('**/.env'),
+    readToken('.env.local'),
+    readToken('**/.env.local'),
+    readToken('.env.*.local'),
+    readToken('**/.env.*.local'),
+    readToken('.env.development'),
+    readToken('**/.env.development'),
+    readToken('.env.production'),
+    readToken('**/.env.production'),
+    readToken('.env.test'),
+    readToken('**/.env.test'),
+    readToken('.env.staging'),
+    readToken('**/.env.staging'),
     writeToken('**/*.key')
   ];
 
@@ -77,8 +90,21 @@ export function generatePlanPermissionsConfig(): CursorCliConfig {
         writeToken('.nibbler/**'),
         writeToken('.cursor/rules/**'),
         writeToken('**/*'), // deny writes anywhere else
-        readToken('.env*'),
-        readToken('**/.env*'),
+        // Block reading real env files (may contain secrets), but allow `.env.example`.
+        readToken('.env'),
+        readToken('**/.env'),
+        readToken('.env.local'),
+        readToken('**/.env.local'),
+        readToken('.env.*.local'),
+        readToken('**/.env.*.local'),
+        readToken('.env.development'),
+        readToken('**/.env.development'),
+        readToken('.env.production'),
+        readToken('**/.env.production'),
+        readToken('.env.test'),
+        readToken('**/.env.test'),
+        readToken('.env.staging'),
+        readToken('**/.env.staging'),
         writeToken('**/*.key')
       ]
     }

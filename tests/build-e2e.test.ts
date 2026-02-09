@@ -99,9 +99,11 @@ describe('nibbler build (e2e, mocked)', () => {
     const { dir: repoRoot } = await createTempGitRepo();
     await setupContract(repoRoot);
 
+    const baseBranch = (await execa('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoRoot })).stdout.trim();
+
     const runner = new MockRunnerAdapter({
       architect: async ({ workspacePath }) => {
-        const jobId = await detectJobId(workspacePath);
+        const jobId = await detectJobId(repoRoot);
         const staged = join(workspacePath, '.nibbler-staging', 'plan', jobId);
         await mkdir(staged, { recursive: true });
         await writeFile(join(staged, 'acceptance.md'), '# acceptance\n', 'utf8');
@@ -119,7 +121,7 @@ tasks:
         );
       },
       worker: async ({ workspacePath, mode }) => {
-        const jobId = await detectJobId(workspacePath);
+        const jobId = await detectJobId(repoRoot);
         if (mode === 'plan') {
           const planDir = join(workspacePath, '.nibbler-staging', jobId, 'plans');
           await mkdir(planDir, { recursive: true });
@@ -138,7 +140,11 @@ tasks:
       expect(res.jobId).toMatch(/^j-\d{8}-\d{3}$/);
 
       const branch = await execa('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoRoot });
-      expect(branch.stdout.trim()).toBe(`nibbler/job-${res.jobId}`);
+      expect(branch.stdout.trim()).toBe(baseBranch);
+
+      // Work must land on the user's branch after merge-back.
+      const srcFile = await readFile(join(repoRoot, 'src', 'x.ts'), 'utf8');
+      expect(srcFile).toContain('export const x');
 
       const planFile = join(repoRoot, '.nibbler', 'jobs', res.jobId!, 'plan', 'acceptance.md');
       const plan = await readFile(planFile, 'utf8');
@@ -154,7 +160,7 @@ tasks:
 
     const runner = new MockRunnerAdapter({
       architect: async ({ workspacePath }) => {
-        const jobId = await detectJobId(workspacePath);
+        const jobId = await detectJobId(repoRoot);
         const staged = join(workspacePath, '.nibbler-staging', 'plan', jobId);
         await mkdir(staged, { recursive: true });
         await writeFile(join(staged, 'acceptance.md'), '# acceptance\n', 'utf8');
@@ -172,7 +178,7 @@ tasks:
         );
       },
       worker: async ({ workspacePath, attempt, mode }) => {
-        const jobId = await detectJobId(workspacePath);
+        const jobId = await detectJobId(repoRoot);
         if (mode === 'plan') {
           const planDir = join(workspacePath, '.nibbler-staging', jobId, 'plans');
           await mkdir(planDir, { recursive: true });
@@ -207,7 +213,7 @@ tasks:
 
     const runner = new MockRunnerAdapter({
       architect: async ({ workspacePath }) => {
-        const jobId = await detectJobId(workspacePath);
+        const jobId = await detectJobId(repoRoot);
         const staged = join(workspacePath, '.nibbler-staging', 'plan', jobId);
         await mkdir(staged, { recursive: true });
         await writeFile(join(staged, 'acceptance.md'), '# acceptance\n', 'utf8');
@@ -225,7 +231,7 @@ tasks:
         );
       },
       worker: async ({ workspacePath, mode }) => {
-        const jobId = await detectJobId(workspacePath);
+        const jobId = await detectJobId(repoRoot);
         if (mode === 'plan') {
           const planDir = join(workspacePath, '.nibbler-staging', jobId, 'plans');
           await mkdir(planDir, { recursive: true });
@@ -253,7 +259,7 @@ tasks:
 
     const runner = new MockRunnerAdapter({
       architect: async ({ workspacePath, attempt }) => {
-        const jobId = await detectJobId(workspacePath);
+        const jobId = await detectJobId(repoRoot);
         const staged = join(workspacePath, '.nibbler-staging', 'plan', jobId);
         await mkdir(staged, { recursive: true });
         await writeFile(join(staged, 'acceptance.md'), `# acceptance attempt=${attempt}\n`, 'utf8');
@@ -271,7 +277,7 @@ tasks:
         );
       },
       worker: async ({ workspacePath, mode }) => {
-        const jobId = await detectJobId(workspacePath);
+        const jobId = await detectJobId(repoRoot);
         if (mode === 'plan') {
           const planDir = join(workspacePath, '.nibbler-staging', jobId, 'plans');
           await mkdir(planDir, { recursive: true });
@@ -300,7 +306,7 @@ tasks:
 
     const runner = new MockRunnerAdapter({
       architect: async ({ workspacePath }) => {
-        const jobId = await detectJobId(workspacePath);
+        const jobId = await detectJobId(repoRoot);
         const staged = join(workspacePath, '.nibbler-staging', 'plan', jobId);
         await mkdir(staged, { recursive: true });
         await writeFile(join(staged, 'acceptance.md'), '# acceptance\n', 'utf8');

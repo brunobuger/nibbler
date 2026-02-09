@@ -1001,13 +1001,9 @@ This is invaluable for testing and for PO review before committing to a full run
 
 **Goal:** Implement remaining CLI commands, harden error handling, improve UX, and write documentation.
 
-### 10.1. Fix Command (`src/cli/commands/fix.ts`)
+### 10.1. Build as the single entrypoint
 
-`nibbler fix "issue"` — A streamlined build for targeted fixes:
-- Skips full discovery (uses existing vision/architecture)
-- Architect plans a minimal fix
-- Fewer roles involved (scope-limited)
-- Faster cycle
+Instead of a separate `fix` command, `nibbler build` handles failures and recovery inline (autonomous Architect retry first, user prompt as last resort) and can offer resuming the last job when re-run.
 
 ### 10.2. Status Command (`src/cli/commands/status.ts`)
 

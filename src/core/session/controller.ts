@@ -55,7 +55,9 @@ export class SessionController {
     const env: Record<string, string> = {};
     if (job.sessionLogPath) {
       // Job stores repo-relative path for portability; runner receives absolute.
-      env.NIBBLER_SESSION_LOG_PATH = joinPath(this.workspace, job.sessionLogPath);
+      // Logs should be written under the main repo root so `nibbler resume` can locate them
+      // even when sessions run inside a separate worktree.
+      env.NIBBLER_SESSION_LOG_PATH = joinPath(job.repoRoot, job.sessionLogPath);
     }
     env.NIBBLER_JOB_ID = job.jobId;
     env.NIBBLER_ROLE_ID = roleId;
@@ -64,10 +66,16 @@ export class SessionController {
       mode: mode === 'plan' ? 'plan' : 'normal',
       taskType: mode === 'plan' ? 'plan' : 'execute'
     });
-    await this.runner.send(
-      handle,
-      options.bootstrapPrompt ?? this.opts.bootstrapPrompt ?? 'Begin your assigned work as described in the project rules overlay.'
-    );
+    const safe = roleId.replaceAll(/[^a-zA-Z0-9_-]/g, '_');
+    const overlayRel = `.cursor/rules/20-role-${safe}.mdc`;
+    const protocolRel = `.cursor/rules/00-nibbler-protocol.mdc`;
+
+    const basePrompt = options.bootstrapPrompt ?? this.opts.bootstrapPrompt;
+    const prompt = basePrompt
+      ? `${basePrompt}\n\nRead and follow:\n- ${overlayRel}\n- ${protocolRel}\n`
+      : `Read and follow:\n- ${overlayRel}\n- ${protocolRel}\n\nBegin your assigned work as described in the overlay.\n`;
+
+    await this.runner.send(handle, prompt);
     return handle;
   }
 

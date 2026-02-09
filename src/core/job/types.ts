@@ -23,6 +23,16 @@ export interface JobState {
   jobId: string;
   currentPhaseId: string;
   startedAtIso: string;
+
+  /**
+   * Optional git isolation for this job: a dedicated worktree and job branch.
+   * When set, all git operations (diff/commit/reset/clean) should run against `worktreePath`,
+   * while engine state/evidence remains rooted under `repoRoot` (main repo working directory).
+   */
+  worktreePath?: string; // absolute path to job worktree (workspace for sessions)
+  sourceBranch?: string; // user's original branch to merge back into
+  jobBranch?: string; // nibbler/job-<id> or nibbler/fix-<id>
+
   preSessionCommit?: string;
   lastDiff?: DiffResult;
 

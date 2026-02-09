@@ -5,6 +5,7 @@ export interface InitBootstrapContext {
   existingContractYaml?: string;
   exampleContracts: Array<{ name: string; description: string; content: string }>;
   contractStagingDir: string;
+  artifactQualitySummary?: string;
 }
 
 export function renderInitBootstrapPrompt(ctx: InitBootstrapContext): string {
@@ -44,9 +45,9 @@ export function renderInitBootstrapPrompt(ctx: InitBootstrapContext): string {
 
   // Explicit doc-reading instructions
   const docsToRead: string[] = [];
-  if (ctx.project.hasVisionMd) docsToRead.push('vision.md');
-  if (ctx.project.hasArchitectureMd) docsToRead.push('ARCHITECTURE.md (or architecture.md)');
-  if (ctx.project.hasPrdMd) docsToRead.push('PRD.md (or prd.md)');
+  if (ctx.project.hasVisionMd) docsToRead.push(ctx.project.visionMdPath ?? 'vision.md');
+  if (ctx.project.hasArchitectureMd) docsToRead.push(ctx.project.architectureMdPath ?? 'architecture.md');
+  if (ctx.project.hasPrdMd) docsToRead.push(ctx.project.prdMdPath ?? 'PRD.md');
   if (docsToRead.length > 0) {
     lines.push('**IMPORTANT:** Read the following files BEFORE proposing the contract:');
     for (const d of docsToRead) lines.push(`  - ${d}`);
@@ -58,6 +59,15 @@ export function renderInitBootstrapPrompt(ctx: InitBootstrapContext): string {
     lines.push('  - Identify technical traits (auth, database, realtime, etc.)');
     lines.push('  - Propose specialized roles that match the actual tech stack (e.g., frontend, backend, sdet)');
     lines.push('  - Do NOT use generic "worker" roles — define roles by specialization.');
+    lines.push('');
+  }
+
+  if (ctx.artifactQualitySummary && ctx.artifactQualitySummary.trim().length > 0) {
+    lines.push('## Artifact quality (engine checks)');
+    lines.push('The engine ran structural checks on input artifacts. Use this to spot gaps and mitigate risk.');
+    lines.push('```text');
+    lines.push(ctx.artifactQualitySummary.trimEnd());
+    lines.push('```');
     lines.push('');
   }
 

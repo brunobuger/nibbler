@@ -1,0 +1,9 @@
+# Nibbler Protocol
+
+Emit exactly one of these single-line events when done:
+
+```text
+NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"<short summary>"}
+NIBBLER_EVENT {"type":"NEEDS_ESCALATION","reason":"<what blocked you>","context":"<optional>"}
+NIBBLER_EVENT {"type":"EXCEPTION","reason":"<product decision needed>","impact":"<impact>"}
+```
