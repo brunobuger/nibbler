@@ -53,16 +53,16 @@ Two commands cover the main workflow — `nibbler init` to establish governance 
 ```mermaid
 flowchart LR
     subgraph once["Setup  (once per project)"]
-        Init["nibbler init\npropose & approve\ngovernance contract"]
+        Init["nibbler init<br/>propose & approve<br/>governance contract"]
     end
 
     subgraph cycle["Per feature / task"]
-        Build["nibbler build\nfull job lifecycle"]
-        Fix["nibbler fix\ncorrect prior output"]
+        Build["nibbler build<br/>full job lifecycle"]
+        Fix["nibbler fix<br/>correct prior output"]
     end
 
     subgraph ops["Anytime"]
-        Ops["nibbler status  ·  nibbler list\nnibbler resume  ·  nibbler history"]
+        Ops["nibbler status  ·  nibbler list<br/>nibbler resume  ·  nibbler history"]
     end
 
     once --> cycle
@@ -80,19 +80,19 @@ Every `nibbler build` runs through four phases with human approval gates — one
 flowchart TD
     Start(["nibbler build 'requirement'"])
 
-    D["1 · Discovery\nAI interviews you\nvision.md · architecture.md"]
+    D["1 · Discovery<br/>AI interviews you<br/>vision.md · architecture.md"]
 
-    P["2 · Planning\nArchitect creates task breakdown\nper-role plans · acceptance criteria"]
+    P["2 · Planning<br/>Architect creates task breakdown<br/>per-role plans · acceptance criteria"]
 
     PG{"PLAN Gate"}
 
-    E["3 · Execution\nRoles work in sequence\nauto-verified after each handoff"]
+    E["3 · Execution<br/>Roles work in sequence<br/>auto-verified after each handoff"]
 
-    S["4 · Ship\nDocs written · final checks"]
+    S["4 · Ship<br/>Docs written · final checks"]
 
     SG{"SHIP Gate"}
 
-    Done(["Merged to your branch\nAudit trail in .nibbler/jobs/"])
+    Done(["Merged to your branch<br/>Audit trail in .nibbler/jobs/"])
 
     Start --> D --> P --> PG
     PG -->|"✗  Reject + feedback"| P
