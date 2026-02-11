@@ -1,49 +1,101 @@
 roles:
   - id: architect
-    scope: ["src/**", "tests/**", "README.md"]
-    authority: { allowedCommands: ["npm test"], allowedPaths: [] }
-    outputExpectations: ["plan artifacts", "tech decisions"]
+    scope: ["vision.md", "architecture.md"]
+    authority: { allowedCommands: ["npm test"], allowedPaths: ["**/*"] }
+    outputExpectations: ["planning artifacts", "delegation plan"]
     verificationMethod: { kind: "none" }
     budget: { maxIterations: 2, exhaustionEscalation: "exception_gate" }
-  - id: worker
+  - id: backend
     scope: ["src/**", "tests/**"]
     authority: { allowedCommands: ["npm test"], allowedPaths: [] }
-    outputExpectations: ["implementation"]
+    outputExpectations: ["implementation", "tests (feature-level)"]
     verificationMethod: { kind: "none" }
     budget: { maxIterations: 3, exhaustionEscalation: "architect" }
+    behavioralGuidance: |
+      Own TDD for backend changes: red → green → refactor.
+      Prefer small steps: add/adjust tests, then implement minimal code to pass.
+  - id: sdet
+    scope: ["tests/**", "e2e/**", ".github/**"]
+    authority: { allowedCommands: ["npm test"], allowedPaths: [] }
+    outputExpectations: ["test harness/CI", "integration/e2e coverage", "flake reduction"]
+    verificationMethod: { kind: "none" }
+    budget: { maxIterations: 2, exhaustionEscalation: "architect" }
+  - id: docs
+    scope: ["README.md", "docs/**"]
+    authority: { allowedCommands: [], allowedPaths: [] }
+    outputExpectations: ["README.md (ship-ready)"]
+    verificationMethod: { kind: "none" }
+    budget: { maxIterations: 2, exhaustionEscalation: "architect" }
 
 sharedScopes:
-  - roles: ["architect", "worker"]
-    patterns: ["src/**", "tests/**"]
+  - roles: ["backend", "sdet"]
+    patterns: ["tests/**"]
 
 phases:
-  - id: discovery
+  - id: planning
     actors: ["architect"]
-    inputBoundaries: ["**/*"]
-    outputBoundaries: ["vision.md", "architecture.md"]
+    inputBoundaries: ["vision.md", "architecture.md"]
+    outputBoundaries: [".nibbler/jobs/**/plan/**"]
     preconditions: [{ type: "always" }]
     completionCriteria:
-      - { type: "artifact_exists", pattern: "vision.md" }
-      - { type: "artifact_exists", pattern: "architecture.md" }
+      - { type: "artifact_exists", pattern: ".nibbler/jobs/**/plan/**" }
     successors: [{ on: "done", next: "execution" }]
   - id: execution
-    actors: ["worker"]
+    actors: ["backend", "sdet"]
     inputBoundaries: ["src/**", "tests/**"]
     outputBoundaries: ["src/**", "tests/**"]
     preconditions: [{ type: "always" }]
     completionCriteria:
+      - { type: "diff_non_empty" }
       - { type: "command_succeeds", command: "npm test" }
+    successors: [{ on: "done", next: "ship" }]
+  - id: ship
+    actors: ["docs"]
+    inputBoundaries: ["**/*"]
+    outputBoundaries: ["README.md", "docs/**"]
+    preconditions: [{ type: "always" }]
+    completionCriteria:
+      - { type: "artifact_exists", pattern: "README.md" }
+      - { type: "markdown_has_headings", path: "README.md", requiredHeadings: ["Install", "Quickstart", "Commands", "Local development"], minChars: 300 }
     successors: []
     isTerminal: true
 
 gates:
-  - id: ship
-    trigger: "discovery->execution"
+  - id: plan
+    trigger: "planning->execution"
     audience: "PO"
+    approvalScope: "build_requirements"
+    approvalExpectations:
+      - "Approve the product requirements and MVP scope for this API/service build."
+      - "Approve the implementation and validation strategy before execution."
+    businessOutcomes:
+      - "Business stakeholders confirm priority outcomes for the API release."
+      - "The team has PO authorization to implement the approved scope."
+    functionalScope:
+      - "Core API capabilities and integration flows are defined in executable tasks."
+      - "Acceptance artifacts specify expected behavior and test coverage targets."
+    outOfScope:
+      - "Endpoints and integrations outside approved planning artifacts are excluded."
+      - "Post-MVP expansion is not approved by this gate."
     requiredInputs:
       - { name: "vision", kind: "path", value: "vision.md" }
       - { name: "architecture", kind: "path", value: "architecture.md" }
-    outcomes: { approve: "execution", reject: "discovery" }
+    outcomes: { approve: "execution", reject: "planning" }
+  - id: ship
+    trigger: "ship->__END__"
+    audience: "PO"
+    approvalScope: "phase_output"
+    approvalExpectations:
+      - "Approve ship-phase release artifacts."
+    businessOutcomes:
+      - "PO confirms release readiness for delivery."
+    functionalScope:
+      - "Final docs capture deployment/runbook expectations for consumers."
+    outOfScope:
+      - "No new implementation scope is approved at SHIP."
+    requiredInputs:
+      - { name: "readme", kind: "path", value: "README.md" }
+    outcomes: { approve: "__END__", reject: "ship" }
 
 globalLifetime:
   maxTimeMs: 1800000

@@ -29,6 +29,13 @@ export function compileContext(
   const phase = contract.phases.find((p) => p.id === phaseId);
 
   const feedback = job.feedbackByRole?.[roleId];
+  const feedbackHistory = job.feedbackHistoryByRole?.[roleId];
+
+  const attempt = job.attemptsByRole?.[roleId] ?? 1;
+  const scopeOverrides = (job.scopeOverridesByRole?.[roleId] ?? [])
+    .filter((o) => o.phaseId === phaseId)
+    .filter((o) => (o.expiresAfterAttempt !== undefined ? attempt <= o.expiresAfterAttempt : true))
+    .map((o) => ({ kind: o.kind, patterns: o.patterns, notes: o.notes }));
 
   const sharedScope = (contract.sharedScopes ?? [])
     .filter((s) => s.roles.includes(roleId))
@@ -42,6 +49,12 @@ export function compileContext(
     ['architecture.md', 'ARCHITECTURE.md', 'Architecture.md'],
     'architecture.md'
   );
+  const prdVariants = ['PRD.md', 'prd.md', 'Prd.md'];
+  const hasPrd = prdVariants.some((v) => existsSync(join(workspaceRoot, v)));
+  const prdRel = resolveDocVariantSync(workspaceRoot, prdVariants, 'PRD.md');
+
+  const handoffWriteRel = `.nibbler-staging/${job.jobId}/handoffs/${roleId}-${phaseId}.md`;
+  const handoffReadDirRel = `.nibbler/jobs/${job.jobId}/plan/handoffs/`;
 
   return {
     identity: { role, sharedScope },
@@ -49,15 +62,18 @@ export function compileContext(
       phaseId,
       phase,
       feedback,
+      feedbackHistory,
+      scopeOverrides,
       delegatedTasks: extras?.delegatedTasks,
       implementationPlanRel: extras?.implementationPlanRel,
-      sessionMode: extras?.sessionMode
+      sessionMode: extras?.sessionMode,
+      handoffWriteRel,
+      handoffReadDirRel
     },
     world: {
-      alwaysRead: [visionRel, architectureRel],
+      alwaysRead: hasPrd ? [visionRel, architectureRel, prdRel] : [visionRel, architectureRel],
       phaseInputs: phase?.inputBoundaries ?? [],
-      phaseOutputs: phase?.outputBoundaries ?? [],
-      gates: contract.gates
+      phaseOutputs: phase?.outputBoundaries ?? []
     }
   };
 }

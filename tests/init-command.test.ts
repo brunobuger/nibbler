@@ -52,6 +52,15 @@ gates:
   - id: plan
     trigger: "p1->p1"
     audience: "PO"
+    approvalScope: "phase_output"
+    approvalExpectations:
+      - "Approve phase output."
+    businessOutcomes:
+      - "PO acknowledges phase completion."
+    functionalScope:
+      - "Phase can transition to the configured next step."
+    outOfScope:
+      - "No additional product scope."
     requiredInputs: []
     outcomes: { approve: "p1", reject: "p1" }
 globalLifetime:
@@ -59,6 +68,12 @@ globalLifetime:
 `,
           'utf8'
         );
+      },
+      rules: async ({ workspacePath }) => {
+        const outDir = join(workspacePath, '.nibbler-staging', 'rules');
+        await mkdir(outDir, { recursive: true });
+        const filler = Array.from({ length: 40 }, () => '- do not invent commands\n').join('');
+        await writeFile(join(outDir, '10-nibbler-workflow.mdc'), `# Workflow\n\n## Commands\n- npm test\n\n## Guardrails\n${filler}`, 'utf8');
       }
     };
 
@@ -69,6 +84,7 @@ globalLifetime:
     try {
       const out = await runInitCommand({ repoRoot, runner, dryRun: true });
       expect(out.ok).toBe(true);
+      expect(runner.startedRoles).toContain('rules');
     } finally {
       delete process.env.NIBBLER_TEST_AUTO_APPROVE;
     }
@@ -83,6 +99,9 @@ globalLifetime:
       exists = false;
     }
     expect(exists).toBe(false);
+
+    // dryRun should not write durable workflow rules into .cursor/rules
+    await expect(readFile(join(repoRoot, '.cursor', 'rules', '10-nibbler-workflow.mdc'), 'utf8')).rejects.toThrow();
   });
 
   it('respects existing ARCHITECTURE.md casing (does not create architecture.md)', async () => {
@@ -137,6 +156,15 @@ gates:
   - id: plan
     trigger: "p1->p1"
     audience: "PO"
+    approvalScope: "phase_output"
+    approvalExpectations:
+      - "Approve phase output."
+    businessOutcomes:
+      - "PO acknowledges phase completion."
+    functionalScope:
+      - "Phase can transition to the configured next step."
+    outOfScope:
+      - "No additional product scope."
     requiredInputs: []
     outcomes: { approve: "p1", reject: "p1" }
 globalLifetime:
@@ -144,6 +172,12 @@ globalLifetime:
 `,
           'utf8'
         );
+      },
+      rules: async ({ workspacePath }) => {
+        const outDir = join(workspacePath, '.nibbler-staging', 'rules');
+        await mkdir(outDir, { recursive: true });
+        const filler = Array.from({ length: 40 }, () => '- keep changes small\n').join('');
+        await writeFile(join(outDir, '10-nibbler-workflow.mdc'), `# Workflow\n\n## Commands\n- npm test\n\n## Guardrails\n${filler}`, 'utf8');
       }
     };
 
@@ -153,6 +187,7 @@ globalLifetime:
     try {
       const out = await runInitCommand({ repoRoot, runner, dryRun: true });
       expect(out.ok).toBe(true);
+      expect(runner.startedRoles).toContain('rules');
     } finally {
       delete process.env.NIBBLER_TEST_AUTO_APPROVE;
     }
@@ -236,6 +271,15 @@ gates:
   - id: plan
     trigger: "p1->p1"
     audience: "PO"
+    approvalScope: "phase_output"
+    approvalExpectations:
+      - "Approve phase output."
+    businessOutcomes:
+      - "PO acknowledges phase completion."
+    functionalScope:
+      - "Phase can transition to the configured next step."
+    outOfScope:
+      - "No additional product scope."
     requiredInputs: []
     outcomes: { approve: "p1", reject: "p1" }
 globalLifetime:
@@ -243,6 +287,12 @@ globalLifetime:
 `,
           'utf8'
         );
+      },
+      rules: async ({ workspacePath }) => {
+        const outDir = join(workspacePath, '.nibbler-staging', 'rules');
+        await mkdir(outDir, { recursive: true });
+        const filler = Array.from({ length: 40 }, () => '- prefer deterministic checks\n').join('');
+        await writeFile(join(outDir, '10-nibbler-workflow.mdc'), `# Workflow\n\n## Commands\n- npm test\n\n## Guardrails\n${filler}`, 'utf8');
       }
     };
 

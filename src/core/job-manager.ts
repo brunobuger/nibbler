@@ -1,21 +1,25 @@
 import type { Contract, RoleDefinition } from './contract/types.js';
 import { checkBudget, checkGlobalBudget, shouldEnforceGate, verifyCompletion, verifyScope } from './policy-engine.js';
+import type { CompletionResult, ScopeResult } from './policy-engine.js';
 import type { EvidenceCollector } from './evidence/collector.js';
 import type { LedgerWriter } from './ledger/writer.js';
+import { LedgerReader } from './ledger/reader.js';
 import type { GateController } from './gate/controller.js';
-import type { JobState, SessionUsage } from './job/types.js';
+import type { JobState, SessionFeedbackSummaryV1, SessionUsage } from './job/types.js';
 import { buildJobStatusSnapshotV1 } from './job/status.js';
 import type { SessionController } from './session/controller.js';
 import { fileExists, readJson, writeJson } from '../utils/fs.js';
-import { commit, clean, diff, getCurrentBranch, getCurrentCommit, git, lsFiles, resetHard } from '../git/operations.js';
+import { addWorktree, commit, clean, diff, getCurrentBranch, getCurrentCommit, git, lsFiles, resetHard } from '../git/operations.js';
 import type { DiffResult } from '../git/diff-parser.js';
-import type { SessionHandle } from './session/types.js';
+import type { SessionHandle, SessionOutcome } from './session/types.js';
 import { buildEffectiveContractForSession, isStructuralOutOfScopeViolation } from './scope/overrides.js';
 import { readDelegationPlanYaml } from './delegation/parser.js';
 import { validateDelegation } from './delegation/validator.js';
 import type { DelegationTask } from './delegation/types.js';
-import { copyFile, mkdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { copyFile, mkdir, readFile, rename, rm, stat } from 'node:fs/promises';
+import { dirname, join, resolve as resolvePath } from 'node:path';
+import { computeGateFingerprint } from './gate/fingerprint.js';
+import picomatch from 'picomatch';
 
 export interface ExecutionPlan {
   roles: string[];
@@ -32,6 +36,12 @@ export interface JobManagerHooks {
   // ── Rendering hooks (CLI UX) ──────────────────────────────────────────
   /** Called when a role session starts. */
   onRoleStart?: (args: { roleId: string; job: JobState; attempt: number; maxAttempts: number }) => void;
+  /** Called when a delegated role-planning session starts (execution phase). */
+  onRolePlanStart?: (args: { roleId: string; job: JobState; attempt: number; maxAttempts: number }) => void;
+  /** Called when a delegated role-planning session succeeds and plan is materialized. */
+  onRolePlanComplete?: (args: { roleId: string; job: JobState; attempt: number; maxAttempts: number; implPlanRel: string }) => void;
+  /** Called when a delegated role-planning session fails and will be retried. */
+  onRolePlanFailed?: (args: { roleId: string; job: JobState; attempt: number; maxAttempts: number; details: unknown }) => void;
   /** Called when a role session completes successfully (before commit). */
   onRoleComplete?: (args: { roleId: string; job: JobState; durationMs: number; diff: DiffResult }) => void;
   /** Called when verification results are available. */
@@ -73,6 +83,21 @@ export class JobManager {
   }
 
   /**
+   * Stop only the active runner handle (best-effort), without finalization.
+   * Used by force-exit cancellation paths where we must tear down children quickly.
+   */
+  async stopActiveSession(): Promise<void> {
+    const active = this.activeHandle;
+    if (!active) return;
+    this.activeHandle = null;
+    try {
+      await this.sessionController.stopSession(active);
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
    * Best-effort cancellation entrypoint for SIGINT/SIGTERM.
    * Captures evidence and writes `job_cancelled` to the ledger.
    */
@@ -80,11 +105,15 @@ export class JobManager {
     this.cancelInfo = info;
     job.state = 'cancelled';
     job.sessionActive = false;
+    job.sessionHandleId = null;
+    job.sessionPid = null;
     await this.persist(job);
 
     if (this.activeHandle) {
+      const active = this.activeHandle;
+      this.activeHandle = null;
       try {
-        await this.sessionController.stopSession(this.activeHandle);
+        await this.sessionController.stopSession(active);
       } catch {
         // best-effort
       }
@@ -114,11 +143,137 @@ export class JobManager {
   async resumeContractJob(job: JobState, contract: Contract): Promise<JobOutcome> {
     const start = job.currentPhaseId || findStartPhaseId(contract);
     if (!start) return { ok: false, reason: 'failed', details: 'No start phase found (phase graph invalid)' };
+    // If the job was paused at a gate, resume by resolving that gate first.
+    // This avoids re-running phase actors and prevents duplicate work/prompts after pauses/crashes.
+    if (job.state === 'paused' && job.pendingGateId) {
+      return await this.resumeFromPendingGate(job, contract);
+    }
     return await this.runContractJobInternal(job, contract, {
       startPhaseId: start,
       startActorIndex: job.currentPhaseActorIndex ?? 0,
       appendJobCreated: false
     });
+  }
+
+  private async resumeFromPendingGate(job: JobState, contract: Contract): Promise<JobOutcome> {
+    const gateId = String(job.pendingGateId ?? '').trim();
+    if (!gateId) {
+      job.state = 'executing';
+      job.pendingGateId = null;
+      await this.persist(job);
+      return await this.runContractJobInternal(job, contract, {
+        startPhaseId: job.currentPhaseId,
+        startActorIndex: job.currentPhaseActorIndex ?? 0,
+        appendJobCreated: false
+      });
+    }
+
+    const gateDef = contract.gates.find((g) => g.id === gateId);
+    if (!gateDef) {
+      const out: JobOutcome = { ok: false, reason: 'failed', details: `Unknown pending gate '${gateId}'` };
+      await this.finalizeForOutcome(job, out);
+      return out;
+    }
+
+    // If we already have an approved resolution for this exact gate state, skip re-prompting.
+    const auto = await this.tryAutoApproveGate(job, gateDef, contract);
+    const resolution = auto ?? (await this.gateController.presentGate(gateDef, job, contract));
+    const mappedRaw = gateDef.outcomes?.[resolution.decision];
+    if (!mappedRaw) {
+      const out: JobOutcome = {
+        ok: false,
+        reason: 'failed',
+        details: { message: 'Gate outcome missing', gate: gateDef, resolution }
+      };
+      await this.finalizeForOutcome(job, out);
+      return out;
+    }
+    const mapped = normalizeTransitionTarget(mappedRaw, contract);
+
+    job.state = 'executing';
+    job.pendingGateId = null;
+    await this.persist(job);
+
+    if (mapped === '__END__') {
+      job.state = 'completed';
+      job.currentRoleId = null;
+      job.currentPhaseActorIndex = undefined;
+      await this.persist(job);
+      await this.finalize(job, 'job_completed', {});
+      return { ok: true };
+    }
+
+    if (!phaseExists(contract, mapped)) {
+      const out: JobOutcome = {
+        ok: false,
+        reason: 'failed',
+        details: {
+          message: 'Gate outcome points to unknown phase',
+          gateId: gateDef.id,
+          mappedRaw,
+          mapped
+        }
+      };
+      await this.finalizeForOutcome(job, out);
+      return out;
+    }
+
+    // Continue orchestration from the mapped phase.
+    return await this.runContractJobInternal(job, contract, {
+      startPhaseId: mapped,
+      startActorIndex: 0,
+      appendJobCreated: false
+    });
+  }
+
+  private jobLedgerPath(job: JobState): string {
+    return join(job.repoRoot, '.nibbler', 'jobs', job.jobId, 'ledger.jsonl');
+  }
+
+  private async readLastGateResolution(job: JobState, gateId: string): Promise<{
+    gateId: string;
+    decision?: 'approve' | 'reject' | 'exception';
+    fingerprint?: string;
+  } | null> {
+    try {
+      const ledger = new LedgerReader(this.jobLedgerPath(job));
+      const { entries } = await ledger.readAllSafe();
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const e: any = entries[i];
+        if (!e || e.type !== 'gate_resolved') continue;
+        const data: any = e.data;
+        if (!data || String(data.gateId ?? '') !== gateId) continue;
+        const decisionRaw = data.decision ? String(data.decision) : undefined;
+        const decision =
+          decisionRaw === 'approve' || decisionRaw === 'reject' || decisionRaw === 'exception' ? decisionRaw : undefined;
+        return {
+          gateId,
+          decision,
+          fingerprint: data.fingerprint ? String(data.fingerprint) : undefined,
+        };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * If the most recent resolution for this gate was APPROVE and the gate fingerprint still matches,
+   * we can safely re-apply approval without prompting (recovery/resume dedupe).
+   *
+   * IMPORTANT: we intentionally do NOT auto-apply REJECT to avoid creating silent loops.
+   */
+  private async tryAutoApproveGate(
+    job: JobState,
+    gateDef: Contract['gates'][number],
+    contract: Contract
+  ): Promise<{ decision: 'approve'; notes?: string } | null> {
+    const last = await this.readLastGateResolution(job, gateDef.id);
+    if (!last || last.decision !== 'approve' || !last.fingerprint) return null;
+    const current = await computeGateFingerprint({ gateDef, job, contract });
+    if (current.fingerprint !== last.fingerprint) return null;
+    return { decision: 'approve', notes: 'auto-approved (unchanged)' };
   }
 
   private async runContractJobInternal(
@@ -246,8 +401,79 @@ export class JobManager {
         firstPhase = false;
         }
 
-        // Terminal phase ends the job.
-        if (phase.isTerminal === true || phase.successors.length === 0) break;
+        // Terminal phase ends the job, but may still have a terminal gate.
+        // Convention: gates can target `${phaseId}->__END__` to run after the final phase completes.
+        if (phase.isTerminal === true || phase.successors.length === 0) {
+          const terminalTransition = `${phaseId}->__END__`;
+          const terminalGate = shouldEnforceGate(terminalTransition, contract);
+          if (terminalGate) {
+            // Dedupe: if this exact gate was already approved and nothing relevant changed, skip re-prompting.
+            const auto = await this.tryAutoApproveGate(job, terminalGate, contract);
+            if (auto) {
+            const mappedRaw = terminalGate.outcomes?.[auto.decision];
+            if (mappedRaw) {
+              const mapped = normalizeTransitionTarget(mappedRaw, contract);
+              if (mapped === '__END__') break; // approve->__END__ is the common case
+              if (!phaseExists(contract, mapped)) {
+                const out: JobOutcome = {
+                  ok: false,
+                  reason: 'failed',
+                  details: {
+                    message: 'Gate outcome points to unknown phase',
+                    gateId: terminalGate.id,
+                    mappedRaw,
+                    mapped
+                  }
+                };
+                await this.finalizeForOutcome(job, out);
+                return out;
+              }
+              phaseId = mapped;
+              continue;
+            }
+            }
+
+            job.state = 'paused';
+            job.pendingGateId = terminalGate.id;
+            await this.persist(job);
+
+            const resolution = await this.gateController.presentGate(terminalGate, job, contract);
+            const mappedRaw = terminalGate.outcomes?.[resolution.decision];
+            if (!mappedRaw) {
+              const out: JobOutcome = {
+                ok: false,
+                reason: 'failed',
+                details: { message: 'Gate outcome missing', gate: terminalGate, resolution }
+              };
+              await this.finalizeForOutcome(job, out);
+              return out;
+            }
+            const mapped = normalizeTransitionTarget(mappedRaw, contract);
+
+            job.state = 'executing';
+            job.pendingGateId = null;
+            await this.persist(job);
+
+            if (mapped === '__END__') break;
+            if (!phaseExists(contract, mapped)) {
+              const out: JobOutcome = {
+                ok: false,
+                reason: 'failed',
+                details: {
+                  message: 'Gate outcome points to unknown phase',
+                  gateId: terminalGate.id,
+                  mappedRaw,
+                  mapped
+                }
+              };
+              await this.finalizeForOutcome(job, out);
+              return out;
+            }
+            phaseId = mapped;
+            continue;
+          }
+          break;
+        }
 
         // Default transition: choose successor with `on=done`, else first successor.
         const next = (phase.successors.find((s) => s.on === 'done') ?? phase.successors[0])?.next;
@@ -260,13 +486,46 @@ export class JobManager {
         const transition = `${phaseId}->${next}`;
         const gateDef = shouldEnforceGate(transition, contract);
         if (gateDef) {
+          // Dedupe: if this exact gate was already approved and nothing relevant changed, skip re-prompting.
+          const auto = await this.tryAutoApproveGate(job, gateDef, contract);
+          if (auto) {
+            const mappedRaw = gateDef.outcomes?.[auto.decision];
+            if (!mappedRaw) {
+              const out: JobOutcome = {
+                ok: false,
+                reason: 'failed',
+                details: { message: 'Gate outcome missing', gate: gateDef, resolution: auto }
+              };
+              await this.finalizeForOutcome(job, out);
+              return out;
+            }
+            const mapped = normalizeTransitionTarget(mappedRaw, contract);
+            if (mapped === '__END__') break;
+            if (!phaseExists(contract, mapped)) {
+              const out: JobOutcome = {
+                ok: false,
+                reason: 'failed',
+                details: {
+                  message: 'Gate outcome points to unknown phase',
+                  gateId: gateDef.id,
+                  mappedRaw,
+                  mapped
+                }
+              };
+              await this.finalizeForOutcome(job, out);
+              return out;
+            }
+            phaseId = mapped;
+            continue;
+          }
+
           job.state = 'paused';
           job.pendingGateId = gateDef.id;
           await this.persist(job);
 
-          const resolution = await this.gateController.presentGate(gateDef, job);
-          const mapped = gateDef.outcomes?.[resolution.decision];
-          if (!mapped) {
+          const resolution = await this.gateController.presentGate(gateDef, job, contract);
+          const mappedRaw = gateDef.outcomes?.[resolution.decision];
+          if (!mappedRaw) {
             const out: JobOutcome = {
               ok: false,
               reason: 'failed',
@@ -275,9 +534,25 @@ export class JobManager {
             await this.finalizeForOutcome(job, out);
             return out;
           }
+          const mapped = normalizeTransitionTarget(mappedRaw, contract);
           job.state = 'executing';
           job.pendingGateId = null;
           await this.persist(job);
+          if (mapped === '__END__') break;
+          if (!phaseExists(contract, mapped)) {
+            const out: JobOutcome = {
+              ok: false,
+              reason: 'failed',
+              details: {
+                message: 'Gate outcome points to unknown phase',
+                gateId: gateDef.id,
+                mappedRaw,
+                mapped
+              }
+            };
+            await this.finalizeForOutcome(job, out);
+            return out;
+          }
           phaseId = mapped;
           continue;
         }
@@ -292,6 +567,10 @@ export class JobManager {
       await this.finalize(job, 'job_completed', {});
       return { ok: true };
     } catch (err: any) {
+      await this.stopActiveSession();
+      job.sessionActive = false;
+      job.sessionHandleId = null;
+      job.sessionPid = null;
       job.state = job.state === 'cancelled' ? 'cancelled' : 'failed';
       await this.persist(job);
       const out: JobOutcome = {
@@ -334,6 +613,10 @@ export class JobManager {
       await this.finalize(job, 'job_completed', {});
       return { ok: true };
     } catch (err: any) {
+      await this.stopActiveSession();
+      job.sessionActive = false;
+      job.sessionHandleId = null;
+      job.sessionPid = null;
       job.state = job.state === 'cancelled' ? 'cancelled' : 'failed';
       await this.persist(job);
       const out: JobOutcome = { ok: false, reason: job.state === 'cancelled' ? 'cancelled' : 'failed', details: { message: String(err?.message ?? err) } };
@@ -351,10 +634,29 @@ export class JobManager {
     const roleDef = mustRole(contract, roleId);
     job.attemptsByRole ??= {};
     job.feedbackByRole ??= {};
-    job.currentRoleMaxIterations = roleDef.budget.maxIterations ?? 1;
+    let maxIterations = roleDef.budget.maxIterations ?? 1;
+    job.currentRoleMaxIterations = maxIterations;
+    let scopeExceptionBonusRetryUsed = false;
+    // Resume durability: only on `nibbler resume` do we rehydrate attempts and scope overrides
+    // from the ledger. For fresh builds and fix-mode recovery, each role invocation starts at attempt=1.
+    const isResume = job.mode === 'resume';
+    if (isResume) {
+      await this.rehydrateRoleStateFromLedger(job, roleId);
+    }
 
-    const maxIterations = roleDef.budget.maxIterations ?? 1;
-    let attempt = 1;
+    // Clear stale feedback from a previous phase so the overlay doesn't show
+    // irrelevant failure details (e.g. planning failure in scaffold overlay).
+    if (!isResume && job.feedbackByRole[roleId]) {
+      delete job.feedbackByRole[roleId];
+      await this.persist(job);
+    }
+    if (!isResume) {
+      job.feedbackHistoryByRole ??= {};
+      delete job.feedbackHistoryByRole[roleId];
+    }
+
+    const prevAttempt = isResume ? (job.attemptsByRole?.[roleId] ?? 0) : 0;
+    let attempt = prevAttempt > 0 ? prevAttempt + 1 : 1;
     while (attempt <= maxIterations) {
       job.attemptsByRole[roleId] = attempt;
       await this.persist(job);
@@ -367,6 +669,9 @@ export class JobManager {
         return { ok: false, reason: 'budget_exceeded', details: globalBudget };
       }
 
+      // Defensive: if the git worktree metadata was removed (stale worktree),
+      // repair it before any git operations so orchestration can continue.
+      await this.ensureWorktreeHealthy(job).catch(() => undefined);
       const repo = git(jobWorkspaceRoot(job));
       const attemptStart = Date.now();
 
@@ -377,6 +682,7 @@ export class JobManager {
       // Delegation-driven execution runs a plan-step before implementation.
       let implPlanRel: string | null = null;
       if (job.currentPhaseId === 'execution' && options.delegatedTasks && options.delegatedTasks.length > 0) {
+        this.hooks.onRolePlanStart?.({ roleId, job, attempt, maxAttempts: maxIterations });
         const planRes = await this.runDelegatedPlanStep(roleId, job, contract, {
           attempt,
           delegatedTasks: options.delegatedTasks
@@ -390,11 +696,25 @@ export class JobManager {
             attempt,
             details: planRes.details
           };
+          this.hooks.onRolePlanFailed?.({
+            roleId,
+            job,
+            attempt,
+            maxAttempts: maxIterations,
+            details: planRes.details
+          });
           await this.persist(job);
           attempt += 1;
           continue;
         }
         implPlanRel = planRes.implPlanRel;
+        this.hooks.onRolePlanComplete?.({
+          roleId,
+          job,
+          attempt,
+          maxAttempts: maxIterations,
+          implPlanRel
+        });
       }
 
       await this.ledger.append({ type: 'session_start', data: { role: roleId, commit: preSessionCommit, mode: 'implement' } } as any);
@@ -407,7 +727,8 @@ export class JobManager {
       job.sessionHandleId = null;
       job.sessionPid = null;
       job.sessionLastActivityAtIso = null;
-      job.sessionLogPath = `.nibbler/jobs/${job.jobId}/evidence/sessions/${roleId}-${job.currentPhaseId}-${attempt}.log`;
+      job.sessionSeq = (job.sessionSeq ?? 0) + 1;
+      job.sessionLogPath = `.nibbler/jobs/${job.jobId}/evidence/sessions/${job.sessionSeq}-${roleId}-${job.currentPhaseId}-${attempt}.log`;
       await this.persist(job);
 
       const effectiveContract = buildEffectiveContractForSession(contract, job, roleId, {
@@ -415,59 +736,333 @@ export class JobManager {
         attempt
       });
 
+      const planningPhase = effectiveContract.phases.find((p) => p.id === 'planning');
+      const planningOutputBoundaries = planningPhase?.outputBoundaries ?? [];
+      const executionPhase = effectiveContract.phases.find((p) => p.id === 'execution');
+      const executionActors = executionPhase?.actors ?? [];
+      const executionActorSet = new Set(executionActors);
+      const roleScopeSummary = effectiveContract.roles
+        .filter((r) => executionActorSet.size === 0 || executionActorSet.has(r.id))
+        .map((r) => {
+          const max = 8;
+          const shown = r.scope.slice(0, max);
+          const suffix = r.scope.length > max ? `, ... (+${r.scope.length - max} more)` : '';
+          return `- ${r.id}: ${shown.join(', ')}${suffix}`;
+        })
+        .join('\n');
+
+      const sharedScopeSummary = (effectiveContract.sharedScopes ?? [])
+        .map((s) => `- Shared by [${s.roles.join(', ')}]: ${s.patterns.join(', ')}`)
+        .join('\n');
+      const retryFeedbackLines = buildPromptRetryFeedbackLines(job.feedbackByRole?.[roleId]);
+
       const planningBootstrapPrompt =
         roleId === 'architect' && job.currentPhaseId === 'planning'
           ? [
               'You are in the PLANNING phase.',
               '',
-              'IMPORTANT: Do NOT implement or scaffold the product yet. Do NOT modify repo files outside planning artifacts.',
+              '## Requirement',
+              job.description?.trim()
+                ? job.description.trim()
+                : '(not provided — read @vision.md and @architecture.md for context)',
+              ...(retryFeedbackLines.length ? ['', ...retryFeedbackLines] : []),
               '',
-              `Write planning artifacts ONLY under: .nibbler-staging/plan/${job.jobId}/`,
+              '## Planning principles',
+              'Right-size the plan: cover the requirement thoroughly, but do not gold-plate.',
+              '- IMPORTANT: Before planning, examine the existing codebase (@package.json, source directories, and relevant files). If the project already has implementations, ONLY plan tasks for what is actually missing, broken, or needs improvement. Do NOT re-plan work that is already done and working.',
+              '- Each task MUST require the agent to create or modify at least one file matching its scopeHints. If the code already exists and works, do NOT include that as a task — the delegation coverage check will fail because the agent has nothing to change.',
+              '- Deliver a complete, working result — include error handling, validation, and tests when the requirement implies them.',
+              '- Use sound engineering judgment: good abstractions are fine when they serve the requirement; premature abstractions are not.',
+              '- Do NOT add features, services, or infrastructure the requirement does not ask for.',
+              '- Do NOT introduce new frameworks or tooling unless the requirement or existing codebase clearly calls for it.',
+              '- Keep each task focused on one clear deliverable. Prefer <= 6 total tasks and <= 3 roles unless more are genuinely needed.',
+              '- If the requirement is broad, prioritize a single-session MVP slice first. Defer optional/advanced integrations unless explicitly required for this build.',
+              '- Do NOT implement or scaffold code. Only write the delegation plan.',
               '',
-              'Required artifact: delegation.yaml (STRICT YAML, schema below). The engine will copy it into .nibbler/jobs/<id>/plan/ before verification.',
+              '## Output',
+              `Write these files under: .nibbler-staging/plan/${job.jobId}/`,
+              '1. `delegation.yaml` (REQUIRED — engine validates schema + scopeHints)',
+              '2. `acceptance.md` (REQUIRED — summarize what "done" looks like for this build)',
               '',
-              'delegation.yaml schema (example):',
+              'The engine copies them to .nibbler/jobs/<id>/plan/ before verification.',
+              '',
+              'Output boundaries (engine-verified):',
+              ...planningOutputBoundaries.map((b) => `- ${b}`),
+              '',
+              '## Schema',
+              '```yaml',
               'version: 1',
               'tasks:',
               '  - taskId: t1',
-              '    roleId: frontend',
-              '    description: "Scaffold Next.js app + basic routes"',
-              '    scopeHints: ["src/app/**", "package.json"]',
+              '    roleId: <role>',
+              '    description: "<specific, single deliverable>"',
+              '    scopeHints: ["<folder>/**"]',
               '    priority: 1',
+              '    dependsOn: []',
+              '```',
+              'Rules:',
+              '- Each scopeHint MUST match a pattern in the assigned role\'s scope or shared scope (validated by engine). Use the exact role scope patterns listed below — do NOT invent paths.',
+              executionActors.length
+                ? `- Delegation tasks MUST target execution-phase actors only: ${executionActors.join(', ')}. Do NOT assign tasks to other roles (architect, docs, etc.) unless they are execution-phase actors.`
+                : '- Delegation tasks MUST target execution-phase actors only (do NOT assign tasks to architect/docs/scaffold).',
+              '- Delegation coverage is enforced: each assigned role must produce file changes matching its scopeHints. Choose scopeHints that correspond to files the role will actually create or modify.',
+              '- Include `dependsOn: []` (empty array) when a task has no dependencies. Reference taskIds for ordering dependencies.',
+              '- IMPORTANT: if a completion criterion includes `command_succeeds: npm test`, tasks must NOT modify the root `"test"` script in package.json. E2E/integration test tools should use separate scripts (e.g. `"test:e2e"`).',
+              '- SDET/test roles: ONLY assign tasks with scopeHints inside the test role\'s own scope (e.g. `tests/**`, `playwright.config.*`). Do NOT assign tasks that require modifying frontend/backend source files (e.g. adding data-testid attributes). If E2E tests need specific attributes in source code, assign that work to the owning role (frontend/backend) instead, or include the specific files in sharedScopes.',
               '',
-              'Notes:',
-              '- tasks[].scopeHints must stay within the role scope (or shared scope) from `.nibbler/contract/team.yaml`.',
-              '- Quote any YAML string values that start with punctuation (e.g. backticks).',
+              'Role scopes (execution-phase roles only):',
+              roleScopeSummary,
+              ...(sharedScopeSummary ? ['', 'Shared scopes:', sharedScopeSummary] : []),
               '',
-              'When finished, emit:',
-              'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"planning artifacts written"}'
+              '## Finishing up',
+              'After writing the delegation plan and acceptance criteria, signal completion by outputting this as plain text in your response (NOT inside any file):',
+              '',
+              '```',
+              'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"planning artifacts written"}',
+              '```',
+              '',
+              'CRITICAL: The NIBBLER_EVENT line is a protocol signal. NEVER write it into any file.'
             ].join('\n')
           : undefined;
 
-      const handle = await this.sessionController.startSession(roleId, job, effectiveContract, {
-        mode: 'implement',
-        delegatedTasks: options.delegatedTasks,
-        implementationPlanRel: implPlanRel ?? undefined,
-        bootstrapPrompt: implPlanRel
-          ? [
+      const scaffoldBootstrapPrompt =
+        roleId === 'architect' && job.currentPhaseId === 'scaffold'
+          ? (() => {
+              const scaffoldPhase = effectiveContract.phases.find((p) => p.id === 'scaffold');
+              const scaffoldRole = mustRole(effectiveContract, 'architect');
+              const scopeList = scaffoldRole.scope.map((s) => `\`${s}\``).join(', ');
+              const allowedPathsList = (scaffoldRole.authority.allowedPaths ?? []).map((s) => `\`${s}\``).join(', ');
+              const sharedForArchitect = (effectiveContract.sharedScopes ?? [])
+                .filter((s) => s.roles.includes('architect'))
+                .flatMap((s) => s.patterns)
+                .map((s) => `\`${s}\``);
+              const sharedLine = sharedForArchitect.length ? sharedForArchitect.join(', ') : '(none)';
+              const outputBounds = scaffoldPhase?.outputBoundaries ?? [];
+              const criteriaLines = (scaffoldPhase?.completionCriteria ?? []).map((c: any) => {
+                if (c.type === 'artifact_exists') return `- File must exist: \`${c.pattern}\``;
+                if (c.type === 'command_succeeds') return `- Command must pass: \`${c.command}\``;
+                return `- ${c.type}`;
+              });
+              return [
+                'You are in the SCAFFOLD phase.',
+                '',
+                '## Goal',
+                'Create the minimum viable project scaffold so execution roles can implement features.',
+                ...(retryFeedbackLines.length ? ['', ...retryFeedbackLines] : []),
+                '',
+                '## Your scope (engine-verified — files outside these patterns cause REVERT)',
+                `Direct scope: ${scopeList}`,
+                ...(allowedPathsList ? [`Allowed paths (extra write access): ${allowedPathsList}`] : []),
+                `Shared scope: ${sharedLine}`,
+                'Files outside these combined patterns will be treated as scope violations and the ENTIRE session is reverted.',
+                '',
+                '## Completion criteria (engine-verified — ALL must pass or session is reverted)',
+                ...criteriaLines,
+                '',
+                '## Output boundaries',
+                ...outputBounds.map((b) => `- \`${b}\``),
+                '',
+                '## CRITICAL: Do not create out-of-scope files',
+                '- Only create/modify files within: Direct scope + Allowed paths + Shared scope.',
+                '- If any output boundary appears to fall outside your allowed write paths, IGNORE it and do not create placeholders there.',
+                '',
+                '## Guidelines',
+                '- Read `@ARCHITECTURE.md` and `@vision.md` first to understand the intended tech stack, directory layout, and tooling.',
+                '- Create project files at paths that satisfy the completion criteria above.',
+                '- The root `package.json` MUST include a `"test"` script that exits 0. Use `"test": "echo ok"` (simplest). Execution roles will add real tests later.',
+                '- The root `package.json` MUST include a `"build"` script that performs a production build. This is used as a completion criterion to catch unresolved imports.',
+                '- Keep scaffold minimal: project config, directory skeleton, placeholder entry points. Do NOT implement product features or domain logic.',
+                '- Do NOT touch `README.md` (the docs role owns it in the ship phase).',
+                '- Run `npm install` after writing `package.json` so `package-lock.json` is created.',
+                '- Add build artifacts and generated files to `.gitignore`. This prevents scope violations from auto-generated files.',
+                '- For multi-directory layouts, run `npm install` in each directory that has a `package.json`.',
+                '- Ensure only the directories WITHIN your allowed write paths exist (create placeholders only when needed). Do NOT create placeholders outside your allowed write paths.',
+                '',
+                '## Tooling config completeness (CRITICAL)',
+                '- Read `@ARCHITECTURE.md` to identify every tool, framework, and build dependency the project uses.',
+                '- For EACH tool/framework, create ALL required config files. If a dependency requires a config file to function (e.g. CSS preprocessors need their config, bundlers need their config, linters need their config), that file MUST exist.',
+                '- Without proper config files, tools will silently fail or produce broken output (blank screens, unstyled pages, missing transpilation).',
+                '- After writing configs, run the build and dev server to verify they work end-to-end. If either fails, diagnose and fix the config.',
+                '',
+                '## Dev server (CRITICAL for local_http_smoke)',
+                '- The root `package.json` MUST include a `"dev"` script that starts the dev server.',
+                '- If the project has a nested/non-standard directory structure, the `"dev"` and `"build"` scripts MUST be configured so they resolve paths correctly. Test BOTH `npm run dev` and `npm run build` before finishing.',
+                '- Verify `npm run dev` actually starts and serves HTTP before finishing scaffold.',
+                '- The dev server should only watch its source directory (not the entire project root) to avoid file-watcher exhaustion in worktrees.',
+                '',
+                '## Dependency completeness (CRITICAL)',
+                '- Every `import` in every source file MUST resolve after `npm install`.',
+                '- After writing `package.json`, run `npm install` and verify it succeeds.',
+                '- Run the project\'s build command and type-checker to verify everything resolves before finishing.',
+                '',
+                '## Output',
+                'Implement scaffold changes now. After all files are written, signal completion by outputting this as plain text in your response (NOT inside any file):',
+                '',
+                '```',
+                'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"scaffold ready"}',
+                '```',
+                '',
+                'CRITICAL: The NIBBLER_EVENT line is a protocol signal. NEVER write it into any file.'
+              ].join('\n');
+            })()
+          : undefined;
+
+      const docsBootstrapPrompt =
+        roleId === 'docs' && job.currentPhaseId === 'ship'
+          ? (() => {
+              const phase = effectiveContract.phases.find((p) => p.id === job.currentPhaseId);
+              const md = phase?.completionCriteria?.find((c: any) => c?.type === 'markdown_has_headings') as any;
+              const required = Array.isArray(md?.requiredHeadings) ? (md.requiredHeadings as string[]) : [];
+              const minChars = typeof md?.minChars === 'number' ? md.minChars : null;
+              const requiredLines = required.length ? required.map((h) => `- ${h}`).join('\n') : '(none)';
+              return [
+                'You are in the SHIP phase (docs).',
+                '',
+                '## Goal',
+                'Produce a ship-ready `README.md` that passes the engine checks.',
+                ...(retryFeedbackLines.length ? ['', ...retryFeedbackLines] : []),
+                '',
+                '## IMPORTANT: Required headings (engine-verified)',
+                'Your `README.md` MUST contain these EXACT headings (plain text, NO emoji prefixes):',
+                requiredLines,
+                '',
+                'Use exactly these markdown headings, for example:',
+                ...required.map((h) => `  \`## ${h}\``),
+                '',
+                ...(minChars != null ? [`Minimum total file length: ${minChars} characters. Write substantive content under each heading.`, ''] : []),
+                '## Content guidelines',
+                '- Read the codebase (`@package.json`, `@vision.md`, `@ARCHITECTURE.md`) to write accurate instructions.',
+                '- The "Install" section should list ALL prerequisites and exact commands to install dependencies.',
+                '- The "Quickstart" section should show how to start the app and what URL to visit.',
+                '- The "Local development" section (if required) should cover how to run the full stack locally (frontend + backend/database).',
+                '- Do NOT invent commands that don\'t exist in `package.json`. Reference ACTUAL scripts.',
+                '',
+                '## Scope',
+                'Only write `README.md`. Do NOT modify any other files.',
+                '',
+                '## Finishing up',
+                'After writing README.md, signal completion by outputting this line as plain text in your response (NOT inside the file):',
+                '',
+                '```',
+                'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"README ready"}',
+                '```',
+                '',
+                'CRITICAL: The NIBBLER_EVENT line is a protocol signal. It must NEVER appear inside README.md or any other file content.'
+              ].join('\n');
+            })()
+          : undefined;
+
+      const sessionMode: 'plan' | 'implement' =
+        roleId === 'architect' && job.currentPhaseId === 'planning' ? 'plan' : 'implement';
+
+      const executionBootstrapPrompt = implPlanRel
+        ? (() => {
+            const execPhase = effectiveContract.phases.find((p) => p.id === job.currentPhaseId);
+            const hasCommandCriterion = (execPhase?.completionCriteria ?? []).some((c: any) => c.type === 'command_succeeds');
+            const commandCriteria = (execPhase?.completionCriteria ?? []).filter((c: any) => c.type === 'command_succeeds').map((c: any) => c.command);
+            const hasLocalHttpSmoke = (execPhase?.completionCriteria ?? []).some((c: any) => c.type === 'local_http_smoke');
+            const execCriteria = (execPhase?.completionCriteria ?? []).map((c: any) => {
+              if (c.type === 'command_succeeds') return `- \`${c.command}\` must pass`;
+              if (c.type === 'diff_non_empty') return '- diff must be non-empty (you must change files)';
+              if (c.type === 'artifact_exists') return `- File must exist: \`${c.pattern}\``;
+              if (c.type === 'local_http_smoke') return `- Dev server must start and respond HTTP 200 at \`${c.url}\` (command: \`${c.startCommand}\`, timeout: ${c.timeoutMs ?? 60000}ms)`;
+              return `- ${c.type}`;
+            });
+            const commandWarning = hasCommandCriterion
+              ? [
+                  '',
+                  '## Command stability',
+                  `The engine runs ${commandCriteria.map(c => `\`${c}\``).join(', ')} after your session; keep them passing.`,
+                  'Do not replace the root `"test"` script. Add separate scripts for extra test suites (for example `"test:e2e"`).',
+                ]
+              : [];
+            const httpSmokeWarning = hasLocalHttpSmoke
+              ? [
+                  '',
+                  '## Dev server stability',
+                  'The engine runs `local_http_smoke` and expects HTTP 200. Keep the `"dev"` script and dev config working end-to-end.',
+                ]
+              : [];
+            const delegatedTasksSummary = options.delegatedTasks?.length
+              ? options.delegatedTasks.map((t) =>
+                  `- [${t.taskId}] ${t.description}${t.scopeHints?.length ? ` → files must match: ${t.scopeHints.join(', ')}` : ''}`
+                ).join('\n')
+              : null;
+            return [
               `Execute the implementation plan at: ${implPlanRel}`,
               '',
-              'Follow the plan closely. If you hit a blocker, emit NEEDS_ESCALATION.',
-            ].join('\n')
-          : planningBootstrapPrompt
-      });
-      this.activeHandle = handle;
-      job.sessionHandleId = handle.id;
-      job.sessionPid = handle.pid ?? null;
-      job.sessionLastActivityAtIso = handle.lastActivityAtIso ?? null;
-      await this.persist(job);
-      const outcome = await this.sessionController.waitForCompletion(handle, roleDef.budget);
-      await this.sessionController.stopSession(handle);
-      this.activeHandle = null;
+              'Follow the plan closely. Implement each step thoroughly but do not add features or refactors the plan does not call for.',
+              ...(retryFeedbackLines.length ? ['', ...retryFeedbackLines] : []),
+              '',
+              '## Scope constraint',
+              'Only create/modify files within your declared scope and shared scope (shown in the overlay above). Out-of-scope files cause the ENTIRE session to be reverted.',
+              '- "Test-related" does NOT mean in-scope by default. Config files (for example Playwright/Jest/Vitest configs) are only allowed if their exact path matches your declared scope/shared patterns.',
+              ...commandWarning,
+              ...httpSmokeWarning,
+              '',
+              '## Completion criteria (ALL must pass)',
+              ...execCriteria,
+              '- Delegation coverage: for EACH assigned task, you must create/modify at least one file matching its scopeHints (listed below).',
+              ...(delegatedTasksSummary ? ['', '## Your assigned tasks (must have file changes for each)', delegatedTasksSummary] : []),
+              '',
+              '',
+              '## CRITICAL: Write files FIRST, run commands SECOND',
+              '- You MUST create/modify source files BEFORE running any test or validation commands.',
+              '- Running long commands (e.g. `npm run test:e2e`, `npx playwright test`, `npm test`) BEFORE writing files risks an inactivity timeout that kills your session with 0 file changes.',
+              '- Pattern to follow: 1) Read plan → 2) Write/edit all files → 3) Run validation commands → 4) Fix issues if any.',
+              '- NEVER run E2E tests or dev servers as your first action. Write code first.',
+              '- The `diff_non_empty` criterion requires at least one file change. If you believe the code is already correct, find a meaningful improvement to make (e.g. better types, explicit qualifiers, documentation).',
+              '',
+              '## Quality bar',
+              '- Run `npm install` after any dependency changes and verify it succeeds.',
+              '- Every import in your code MUST resolve. Do not reference packages not in package.json. If you add an import, add the dependency to package.json AND run `npm install`.',
+              '- After writing all your code, run `npm run build` (if the script exists) to verify no unresolved imports or build errors. Fix any errors before finishing.',
+              '- If you create new files, make sure they are importable from existing code paths.',
+              '- Do NOT modify files outside your declared scope — the ENTIRE session will be reverted.',
+              '- Do NOT modify build/dev server configuration files unless your plan explicitly requires it.',
+              '- Read `@ARCHITECTURE.md` and `@package.json` before adding any new dependency. Do NOT introduce frameworks or tooling that conflict with the existing stack.',
+              '',
+              'If you hit a blocker, output this as plain text in your response (NOT inside any file):',
+              '',
+              '```',
+              'NIBBLER_EVENT {"type":"NEEDS_ESCALATION","reason":"<what blocked you>"}',
+              '```',
+            ].join('\n');
+          })()
+        : undefined;
 
-      job.sessionActive = false;
-      job.sessionLastActivityAtIso = handle.lastActivityAtIso ?? job.sessionLastActivityAtIso ?? null;
-      await this.persist(job);
+      let handle: SessionHandle | null = null;
+      let outcome: SessionOutcome | null = null;
+      try {
+        handle = await this.sessionController.startSession(roleId, job, effectiveContract, {
+          mode: sessionMode,
+          delegatedTasks: options.delegatedTasks,
+          implementationPlanRel: implPlanRel ?? undefined,
+          bootstrapPrompt: executionBootstrapPrompt
+            ?? planningBootstrapPrompt ?? scaffoldBootstrapPrompt ?? docsBootstrapPrompt
+        });
+        this.activeHandle = handle;
+        job.sessionHandleId = handle.id;
+        job.sessionPid = handle.pid ?? null;
+        job.sessionLastActivityAtIso = handle.lastActivityAtIso ?? null;
+        await this.persist(job);
+        outcome = await this.sessionController.waitForCompletion(handle, roleDef.budget, {
+          onHeartbeat: ({ lastActivityAtIso }) => this.persistSessionHeartbeat(job, lastActivityAtIso)
+        });
+      } finally {
+        await this.closeSession(job, handle);
+      }
+      if (!outcome) {
+        throw new Error(`Session for role '${roleId}' ended without an outcome`);
+      }
+
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/25aab501-c72a-437e-b834-e0245fea140d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'build-e2e-retry',hypothesisId:'H5',location:'src/core/job-manager.ts:runRoleSession',message:'session outcome captured',data:{jobId:job.jobId,phaseId:job.currentPhaseId,roleId,attempt,outcomeKind:outcome.kind,eventType:outcome.kind==='event' ? outcome.event.type : null,eventSummary:outcome.kind==='event' ? (outcome.event as any).summary ?? null : null,exitCode:outcome.kind==='process_exit' ? outcome.exitCode ?? null : null,signal:outcome.kind==='process_exit' ? outcome.signal ?? null : null},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+
+      // Best-effort: materialize handoff artifact for this session (all sessions, plan or implement).
+      // This is not enforced as a completion criterion.
+      await this.materializeHandoffBestEffort(job, roleId, job.currentPhaseId).catch(() => undefined);
 
       if (job.state === 'cancelled' || this.cancelInfo) {
         return { ok: false, reason: 'cancelled', details: { cancelled: true, info: this.cancelInfo } };
@@ -510,11 +1105,140 @@ export class JobManager {
         continue;
       }
 
+      if (outcome.kind === 'budget_exceeded') {
+        await resetHard(repo, preSessionCommit);
+        await clean(repo);
+        await this.ledger.append({
+          type: 'session_reverted',
+          data: { role: roleId, attempt, reason: 'session_budget_exceeded' }
+        });
+        job.feedbackByRole ??= {};
+        job.feedbackByRole[roleId] = {
+          kind: 'session_timeout',
+          reason: 'budget_exceeded',
+          attempt,
+          message: 'Session exceeded its maxTimeMs budget and was terminated.'
+        } as any;
+        await this.persist(job);
+        return { ok: false, reason: 'budget_exceeded', details: { roleId, attempt, outcome } };
+      }
+
+      if (outcome.kind === 'inactive_timeout') {
+        await resetHard(repo, preSessionCommit);
+        await clean(repo);
+        await this.ledger.append({
+          type: 'session_reverted',
+          data: { role: roleId, attempt, reason: 'session_inactive_timeout' }
+        });
+        job.feedbackByRole ??= {};
+        job.feedbackByRole[roleId] = {
+          kind: 'session_timeout',
+          reason: 'inactive_timeout',
+          attempt,
+          message: 'Session produced no activity before the inactivity timeout and was terminated.'
+        } as any;
+        await this.persist(job);
+        return { ok: false, reason: 'failed', details: { roleId, attempt, outcome } };
+      }
+
+      if (outcome.kind === 'process_exit') {
+        const hasSignal = typeof outcome.signal === 'string' && outcome.signal.trim().length > 0;
+        const hasExitCode = typeof outcome.exitCode === 'number';
+        const exitedWithErrorCode = hasExitCode && outcome.exitCode !== 0;
+        const unexpectedDeath = hasSignal && outcome.signal !== null;
+        const exitedWithoutProtocol =
+          (hasExitCode && outcome.exitCode === 0 && !hasSignal) ||
+          (!hasExitCode && !hasSignal);
+
+        // Fallback path: Cursor exited without a protocol event.
+        // Continue with deterministic post-session verification instead of failing immediately.
+        if (exitedWithoutProtocol) {
+          await this.ledger.append({
+            type: 'custom_check',
+            data: {
+              kind: 'session_protocol_missing',
+              role: roleId,
+              attempt,
+              exitCode: outcome.exitCode ?? null,
+              signal: outcome.signal ?? null
+            }
+          } as any);
+          job.feedbackByRole ??= {};
+          job.feedbackByRole[roleId] = {
+            ...(job.feedbackByRole?.[roleId] && typeof job.feedbackByRole[roleId] === 'object'
+              ? (job.feedbackByRole[roleId] as any)
+              : {}),
+            kind: 'session_protocol_missing',
+            attempt,
+            exitCode: outcome.exitCode ?? null,
+            signal: outcome.signal ?? null,
+            engineHint:
+              'Previous attempt exited without an explicit NIBBLER_EVENT completion signal. ' +
+              'Do the work normally, then end your final response with a single `NIBBLER_EVENT {"type":"PHASE_COMPLETE",...}` line.'
+          };
+          await this.persist(job);
+        } else if (exitedWithErrorCode || unexpectedDeath) {
+          await resetHard(repo, preSessionCommit);
+          await clean(repo);
+          await this.ledger.append({
+            type: 'session_reverted',
+            data: {
+              role: roleId,
+              attempt,
+              reason: 'session_process_exit',
+              exitCode: outcome.exitCode ?? null,
+              signal: outcome.signal ?? null
+            }
+          });
+          job.feedbackByRole ??= {};
+          job.feedbackByRole[roleId] = {
+            ...(job.feedbackByRole?.[roleId] && typeof job.feedbackByRole[roleId] === 'object'
+              ? (job.feedbackByRole[roleId] as any)
+              : {}),
+            kind: 'session_process_exit',
+            attempt,
+            exitCode: outcome.exitCode ?? null,
+            signal: outcome.signal ?? null,
+            engineHint:
+              `Previous attempt exited before completion (exitCode=${String(outcome.exitCode ?? 'null')}, signal=${String(
+                outcome.signal ?? 'null'
+              )}). Keep changes focused, write files first, and end with a valid NIBBLER_EVENT line.`
+          };
+          await this.persist(job);
+          attempt += 1;
+          continue;
+        }
+      }
+
+      // If the session (or environment) damaged worktree metadata, repair before diffing.
+      const repairedAfterSession = await this.ensureWorktreeHealthy(job).catch(() => ({ repaired: false as const }));
+      if (repairedAfterSession.repaired) {
+        job.feedbackByRole ??= {};
+        job.feedbackByRole[roleId] = {
+          kind: 'worktree_repaired',
+          attempt,
+          message:
+            'Engine repaired a broken git worktree (missing .git/worktrees metadata). ' +
+            'Your uncommitted changes could not be verified and may have been discarded. ' +
+            'Retry the session and do NOT modify `.git/**` or run `git worktree` commands.'
+        } as any;
+        await this.persist(job);
+        attempt += 1;
+        continue;
+      }
+
       const dAll = await diff(repo, preSessionCommit);
       const d = filterEngineFiles(dAll);
       job.lastDiff = d;
       await this.persist(job);
+      const prematurePhaseComplete = outcome.kind === 'event' && outcome.event.type === 'PHASE_COMPLETE';
+      if (outcome.kind === 'event' && outcome.event.type === 'PHASE_COMPLETE' && d.files.length === 0) {
+        // #region agent log
+        fetch('http://127.0.0.1:7243/ingest/25aab501-c72a-437e-b834-e0245fea140d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'build-e2e-retry',hypothesisId:'H5',location:'src/core/job-manager.ts:runRoleSession',message:'phase_complete event had empty diff',data:{jobId:job.jobId,phaseId:job.currentPhaseId,roleId,attempt,eventSummary:(outcome.event as any).summary ?? null},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+      }
 
+      const isEmptyDiff = d.files.length === 0;
       const effectiveRoleDef = mustRole(effectiveContract, roleId);
       const scope = verifyScope(d, effectiveRoleDef, effectiveContract);
       if (this.hooks.beforeVerifyCompletion) {
@@ -599,18 +1323,86 @@ export class JobManager {
         completionPassed: completion.passed,
       });
 
+      const attemptSummary: SessionFeedbackSummaryV1 = buildAttemptSummary({
+        attempt,
+        scope,
+        completion,
+        isEmptyDiff,
+      });
+      if (prematurePhaseComplete && isEmptyDiff) {
+        const extra =
+          'You emitted PHASE_COMPLETE before producing required file changes. Do NOT emit NIBBLER_EVENT until delegation.yaml and acceptance.md are written to `.nibbler-staging/plan/<jobId>/`.';
+        attemptSummary.engineHint = attemptSummary.engineHint ? `${attemptSummary.engineHint}\n\n${extra}` : extra;
+      }
+
+      job.feedbackHistoryByRole ??= {};
+      const prevAttemptSummary =
+        job.feedbackHistoryByRole[roleId] && job.feedbackHistoryByRole[roleId]!.length > 0
+          ? job.feedbackHistoryByRole[roleId]![job.feedbackHistoryByRole[roleId]!.length - 1]!
+          : null;
+      const currentFailedCriteria = (attemptSummary.completion?.failedCriteria ?? []).slice().sort().join('||');
+      const prevFailedCriteria = (prevAttemptSummary?.completion?.failedCriteria ?? []).slice().sort().join('||');
+      const repeatedCompletionFailure =
+        !!prevAttemptSummary &&
+        prevAttemptSummary.scope?.passed === true &&
+        prevAttemptSummary.completion?.passed === false &&
+        scope.passed === true &&
+        completion.passed === false &&
+        currentFailedCriteria.length > 0 &&
+        currentFailedCriteria === prevFailedCriteria;
+      job.feedbackHistoryByRole[roleId] ??= [];
+      job.feedbackHistoryByRole[roleId].push(attemptSummary);
+
       job.feedbackByRole[roleId] = {
+        ...(job.feedbackByRole?.[roleId] && typeof job.feedbackByRole[roleId] === 'object'
+          ? (job.feedbackByRole[roleId] as any)
+          : {}),
         outcome,
         scope,
         completion,
         budget,
-        attempt
+        attempt,
+        engineHint: attemptSummary.engineHint,
       };
+      await this.ledger.append({
+        type: 'session_feedback',
+        data: { jobId: job.jobId, role: roleId, ...attemptSummary }
+      });
       await this.persist(job);
+
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/25aab501-c72a-437e-b834-e0245fea140d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'build-e2e-retry',hypothesisId:'H2',location:'src/core/job-manager.ts:runRoleSession',message:'session retry decision context',data:{jobId:job.jobId,phaseId:job.currentPhaseId,roleId,attempt,maxIterations,scopePassed:scope.passed,completionPassed:completion.passed,failedCriteria:attemptSummary.completion?.failedCriteria ?? [],repeatedCompletionFailure},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
 
       // Budget exceeded after attempt → escalate.
       if (!budget.passed) {
-        return await this.escalate(roleId, job, contract, budget);
+        return await this.escalate(roleId, job, contract, budget, 'budget_exhausted');
+      }
+
+      // Completion-only failures that repeat with the exact same signature are usually not fixed by blind retries.
+      // Escalate early to avoid burning the whole iteration budget on identical outcomes.
+      if (repeatedCompletionFailure && scope.passed && !completion.passed) {
+        const repeatedFailureDetails = {
+          kind: 'repeated_completion_failure',
+          roleId,
+          attempt,
+          failedCriteria: attemptSummary.completion?.failedCriteria ?? [],
+          maxIterations
+        };
+        await this.ledger.append({
+          type: 'session_escalated',
+          data: {
+            jobId: job.jobId,
+            role: roleId,
+            reason: 'repeated_completion_failure',
+            attempt,
+            failedCriteria: attemptSummary.completion?.failedCriteria ?? [],
+          }
+        });
+        // #region agent log
+        fetch('http://127.0.0.1:7243/ingest/25aab501-c72a-437e-b834-e0245fea140d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'build-e2e-retry',hypothesisId:'H3',location:'src/core/job-manager.ts:runRoleSession',message:'early escalation on repeated completion failure',data:{jobId:job.jobId,phaseId:job.currentPhaseId,roleId,attempt,failedCriteria:attemptSummary.completion?.failedCriteria ?? []},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+        return await this.escalate(roleId, job, contract, repeatedFailureDetails, 'repeated_completion_failure');
       }
 
       // Scope violations: severity-based escalation path (early decision).
@@ -652,6 +1444,19 @@ export class JobManager {
               ownerHints: structural.ownerHints
             });
 
+            const decisionSummary: { decision: string; patterns?: string[]; notes?: string } =
+              decision.decision === 'grant_narrow_access'
+                ? { decision: decision.decision, patterns: decision.patterns, notes: decision.notes }
+                : { decision: decision.decision, notes: (decision as any).notes };
+
+            // Inject the Architect's decision into worker-visible feedback so the next attempt's overlay
+            // clearly communicates what changed (especially for scope overrides).
+            const hist = job.feedbackHistoryByRole?.[roleId];
+            const last = hist && hist.length ? hist[hist.length - 1] : null;
+            if (last) last.scopeDecision = decisionSummary;
+            const fb = job.feedbackByRole?.[roleId];
+            if (fb && typeof fb === 'object') (fb as any).scopeDecision = decisionSummary;
+
             if (decision.decision === 'terminate') {
               job.state = 'failed';
               await this.persist(job);
@@ -677,6 +1482,30 @@ export class JobManager {
                 expiresAfterAttempt: decision.expiresAfterAttempt,
                 notes: decision.notes
               });
+              const hint =
+                `Scope override granted by Architect (${decision.kind}): ` +
+                `${decision.patterns.map((p) => `\`${p}\``).join(', ')}.` +
+                ` You must still satisfy BOTH scope and completion checks.`;
+              if (last) last.engineHint = last.engineHint ? `${last.engineHint}\n\n${hint}` : hint;
+              if (fb && typeof fb === 'object') {
+                const prev = typeof (fb as any).engineHint === 'string' ? String((fb as any).engineHint) : '';
+                (fb as any).engineHint = prev ? `${prev}\n\n${hint}` : hint;
+              }
+
+              // If this grant arrives on the final planned attempt, provide one bounded
+              // extra retry so the worker can actually consume the granted exception.
+              if (!scopeExceptionBonusRetryUsed && attempt >= maxIterations) {
+                maxIterations += 1;
+                scopeExceptionBonusRetryUsed = true;
+                job.currentRoleMaxIterations = maxIterations;
+                const bonusHint =
+                  'Architect granted a narrow scope exception on your final planned iteration; one additional retry was granted to apply it.';
+                if (last) last.engineHint = last.engineHint ? `${last.engineHint}\n\n${bonusHint}` : bonusHint;
+                if (fb && typeof fb === 'object') {
+                  const prev = typeof (fb as any).engineHint === 'string' ? String((fb as any).engineHint) : '';
+                  (fb as any).engineHint = prev ? `${prev}\n\n${bonusHint}` : bonusHint;
+                }
+              }
               await this.persist(job);
             }
           }
@@ -687,7 +1516,7 @@ export class JobManager {
     }
 
     // Out of iterations.
-    return await this.escalate(roleId, job, contract, { passed: false, escalation: roleDef.budget.exhaustionEscalation });
+    return await this.escalate(roleId, job, contract, { passed: false, escalation: roleDef.budget.exhaustionEscalation }, 'budget_exhausted');
   }
 
   private async verifyDelegationPlanIfPresent(
@@ -718,8 +1547,8 @@ export class JobManager {
           'tasks:',
           '  - taskId: t1',
           '    roleId: frontend',
-          '    description: "Scaffold Next.js app + basic routes"',
-          '    scopeHints: ["src/app/**", "package.json"]',
+          '    description: "Implement main UI components"',
+          '    scopeHints: ["frontend/**"]',
           '    priority: 1',
           '',
         ].join('\n'),
@@ -789,6 +1618,115 @@ export class JobManager {
       };
       await this.persist(job);
       return { passed: false, message: `delegation plan parse failed`, evidence: { evidencePath } };
+    }
+  }
+
+  private async rehydrateRoleStateFromLedger(job: JobState, roleId: string): Promise<void> {
+    // Rehydrate feedback history (attempt summaries) for this role.
+    job.feedbackHistoryByRole ??= {};
+    if (!Array.isArray(job.feedbackHistoryByRole[roleId]) || job.feedbackHistoryByRole[roleId]!.length === 0) {
+      const hist = await this.readSessionFeedbackHistoryFromLedger(job, roleId);
+      if (hist.length > 0) {
+        job.feedbackHistoryByRole[roleId] = hist;
+        // Also restore attempt counter for budgeting + display.
+        const lastAttempt = hist[hist.length - 1]?.attempt ?? 0;
+        job.attemptsByRole ??= {};
+        if (lastAttempt > 0) job.attemptsByRole[roleId] = lastAttempt;
+      }
+    }
+
+    // Rehydrate scope overrides (grants) so retries after resume keep the expanded effective scope.
+    await this.rehydrateScopeOverridesFromLedger(job);
+  }
+
+  private async readSessionFeedbackHistoryFromLedger(job: JobState, roleId: string): Promise<SessionFeedbackSummaryV1[]> {
+    try {
+      const reader = new LedgerReader(jobLedgerPathAbs(job));
+      const entries = await reader.findByType('session_feedback');
+      const items: SessionFeedbackSummaryV1[] = [];
+      for (const e of entries as any[]) {
+        const data = (e as any)?.data;
+        if (!data || typeof data !== 'object') continue;
+        if (String((data as any).role ?? '') !== roleId) continue;
+        const { role: _role, jobId: _jobId, ...rest } = data as any;
+        if (typeof rest.attempt !== 'number') continue;
+        items.push(rest as SessionFeedbackSummaryV1);
+      }
+
+      // Decorate attempt summaries with any scope-exception decisions so the overlay can show
+      // explicit Architect decisions even after `nibbler resume`.
+      const decorate = async (type: 'scope_exception_granted' | 'scope_exception_denied') => {
+        const scopeEntries = await reader.findByType(type);
+        for (const env of scopeEntries as any[]) {
+          const data = env?.data;
+          if (!data || typeof data !== 'object') continue;
+          if (String(data.role ?? '') !== roleId) continue;
+          if (typeof data.attempt !== 'number') continue;
+          const target = items.find((x) => x.attempt === data.attempt);
+          if (!target) continue;
+
+          if (type === 'scope_exception_granted') {
+            const patterns: string[] = Array.isArray(data.patterns) ? data.patterns.map((p: any) => String(p)).filter(Boolean) : [];
+            target.scopeDecision = { decision: 'grant_narrow_access', patterns, notes: data.notes ? String(data.notes) : undefined };
+          } else {
+            const reason = data.reason ? String(data.reason) : 'denied';
+            target.scopeDecision = { decision: reason, notes: data.notes ? String(data.notes) : undefined };
+          }
+        }
+      };
+      await decorate('scope_exception_granted');
+      await decorate('scope_exception_denied');
+
+      return items;
+    } catch {
+      return [];
+    }
+  }
+
+  private async rehydrateScopeOverridesFromLedger(job: JobState): Promise<void> {
+    const existing = job.scopeOverridesByRole;
+    if (existing && Object.keys(existing).length > 0) return;
+
+    try {
+      const reader = new LedgerReader(jobLedgerPathAbs(job));
+      const entries = await reader.findByType('scope_exception_granted');
+      const overridesByRole: NonNullable<JobState['scopeOverridesByRole']> = {};
+
+      for (const e of entries as any[]) {
+        const env = e as any;
+        const data = env?.data;
+        if (!data || typeof data !== 'object') continue;
+
+        const roleId = String(data.role ?? '').trim();
+        if (!roleId) continue;
+        const kindRaw = String(data.kind ?? 'shared_scope');
+        const kind = kindRaw === 'extra_scope' ? 'extra_scope' : 'shared_scope';
+        const patterns: string[] = Array.isArray(data.patterns) ? data.patterns.map((p: any) => String(p)).filter(Boolean) : [];
+        if (patterns.length === 0) continue;
+
+        const phaseId = String(data.phaseId ?? job.currentPhaseId ?? 'execution');
+        const ownerRoleId = data.ownerRoleId ? String(data.ownerRoleId) : undefined;
+        const expiresAfterAttempt = data.expiresAfterAttempt !== undefined ? Number(data.expiresAfterAttempt) : undefined;
+        const notes = data.notes ? String(data.notes) : undefined;
+        const grantedAtIso = typeof env.timestamp === 'string' ? String(env.timestamp) : new Date().toISOString();
+
+        overridesByRole[roleId] ??= [];
+        overridesByRole[roleId]!.push({
+          kind,
+          patterns,
+          ownerRoleId,
+          phaseId,
+          grantedAtIso,
+          expiresAfterAttempt,
+          notes,
+        });
+      }
+
+      if (Object.keys(overridesByRole).length > 0) {
+        job.scopeOverridesByRole = overridesByRole;
+      }
+    } catch {
+      // ignore
     }
   }
 
@@ -864,6 +1802,7 @@ export class JobManager {
       type: 'scope_exception_requested',
       data: {
         jobId: job.jobId,
+        phaseId: job.currentPhaseId,
         role: req.failedRoleId,
         attempt: req.attempt,
         protectedPaths: req.protectedPaths,
@@ -895,11 +1834,69 @@ export class JobManager {
     job.sessionHandleId = null;
     job.sessionPid = null;
     job.sessionLastActivityAtIso = null;
-    job.sessionLogPath = `.nibbler/jobs/${job.jobId}/evidence/sessions/architect-scope-exception-${req.failedRoleId}-${job.currentPhaseId}-${req.attempt}.log`;
+    job.sessionSeq = (job.sessionSeq ?? 0) + 1;
+    job.sessionLogPath =
+      `.nibbler/jobs/${job.jobId}/evidence/sessions/` +
+      `${job.sessionSeq}-architect-scope-exception-${req.failedRoleId}-${job.currentPhaseId}-${req.attempt}.log`;
     await this.persist(job);
+
+    const ownerHintsLines =
+      req.ownerHints.length > 0
+        ? req.ownerHints
+            .slice(0, 40)
+            .map((h) => `- ${h.file}: ${h.owners.length ? h.owners.join(', ') : '(unknown)'}`)
+            .join('\n')
+        : '(none)';
+
+    const protectedLines = req.protectedPaths.length ? req.protectedPaths.map((p) => `- ${p}`).join('\n') : '(none)';
+    const outOfScopeLines = req.outOfScopePaths.length ? req.outOfScopePaths.map((p) => `- ${p}`).join('\n') : '(none)';
+
+    // Offer a few "narrow but practical" suggestions the Architect can pick from.
+    // NOTE: This is advisory only; the Architect still decides based on project intent.
+    // The engine generates suggestions by grouping related paths into directory-level patterns
+    // where appropriate, otherwise suggesting exact paths (narrowest).
+    const suggestedPatterns = Array.from(
+      new Set(
+        req.outOfScopePaths.flatMap((p) => {
+          // Group well-known generated/report directories into wildcards.
+          const dir = p.split('/')[0];
+          if (dir && p.includes('/') && ['playwright-report', 'test-results', 'coverage', '.nyc_output', 'dist', 'build'].includes(dir)) {
+            return [`${dir}/**`];
+          }
+          // Default: allow the exact path (narrowest).
+          return [p];
+        })
+      )
+    )
+      .slice(0, 12)
+      .map((p) => `- ${p}`)
+      .join('\n');
 
     const decisionBootstrapPrompt = [
       'You are the Architect. The engine requires a scope-exception decision for a worker role.',
+      '',
+      `Failed role: ${req.failedRoleId}`,
+      `Phase: ${job.currentPhaseId}`,
+      `Attempt: ${req.attempt}`,
+      '',
+      'The worker met completion criteria but violated scope.',
+      '',
+      '## Out-of-scope paths (from verification)',
+      outOfScopeLines,
+      '',
+      '## Protected paths (non-negotiable; NEVER grant)',
+      protectedLines,
+      '',
+      '## Ownership hints (file -> likely owning roles)',
+      ownerHintsLines,
+      '',
+      '## What you should do',
+      '- Prefer **grant_narrow_access** only when the violating files are necessary to achieve the requirement and cannot reasonably be moved into the worker scope.',
+      '- Prefer kind: "shared_scope" (preferred) when multiple roles legitimately need the path. Use "extra_scope" for a one-off exception.',
+      '- Keep patterns as narrow as possible (single files over directories).',
+      '',
+      'Suggested narrow patterns (optional; pick the minimum that resolves the blocker):',
+      suggestedPatterns.length ? suggestedPatterns : '(none)',
       '',
       `Write a JSON decision file at: ${decisionRel}`,
       '',
@@ -915,32 +1912,37 @@ export class JobManager {
       '- optional: ownerRoleId, expiresAfterAttempt, notes',
       '',
       'Example:',
-      '{"decision":"grant_narrow_access","kind":"shared_scope","patterns":[".gitignore","next-env.d.ts"],"notes":"Next.js scaffolding requires these root files."}',
+      '{"decision":"grant_narrow_access","kind":"shared_scope","patterns":[".gitignore","test-results/**"],"notes":"Allow generated test artifacts for E2E runs."}',
       '',
-      'When finished, emit:',
+      'After writing the decision file, signal completion by outputting this as plain text in your response (NOT inside any file):',
+      '',
+      '```',
       'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"scope exception decision written"}',
+      '```',
       '',
     ].join('\n');
 
     // Run a single Architect session to produce the decision file.
-    const handle = await this.sessionController.startSession('architect', job, restrictedContract, {
-      bootstrapPrompt: decisionBootstrapPrompt
-    });
-    this.activeHandle = handle;
-    job.sessionHandleId = handle.id;
-    job.sessionPid = handle.pid ?? null;
-    job.sessionLastActivityAtIso = handle.lastActivityAtIso ?? null;
-    await this.persist(job);
+    let handle: SessionHandle | null = null;
+    try {
+      handle = await this.sessionController.startSession('architect', job, restrictedContract, {
+        bootstrapPrompt: decisionBootstrapPrompt
+      });
+      this.activeHandle = handle;
+      job.sessionHandleId = handle.id;
+      job.sessionPid = handle.pid ?? null;
+      job.sessionLastActivityAtIso = handle.lastActivityAtIso ?? null;
+      await this.persist(job);
 
-    await this.sessionController.waitForCompletion(handle, mustRole(contract, 'architect').budget);
-    await this.sessionController.stopSession(handle);
-    this.activeHandle = null;
-
-    job.sessionActive = false;
-    job.sessionLastActivityAtIso = handle.lastActivityAtIso ?? job.sessionLastActivityAtIso ?? null;
-    job.currentRoleId = prevRoleId;
-    job.sessionLogPath = prevSessionLogPath;
-    await this.persist(job);
+      await this.sessionController.waitForCompletion(handle, mustRole(contract, 'architect').budget, {
+        onHeartbeat: ({ lastActivityAtIso }) => this.persistSessionHeartbeat(job, lastActivityAtIso)
+      });
+    } finally {
+      await this.closeSession(job, handle);
+      job.currentRoleId = prevRoleId;
+      job.sessionLogPath = prevSessionLogPath;
+      await this.persist(job);
+    }
 
     // Enforce: Architect decision must not modify non-engine paths.
     const dAll = await diff(repo, pre);
@@ -950,7 +1952,7 @@ export class JobManager {
       await clean(repo);
       await this.ledger.append({
         type: 'scope_exception_denied',
-        data: { jobId: job.jobId, role: req.failedRoleId, reason: 'architect_modified_repo', diffSummary: d.summary }
+        data: { jobId: job.jobId, phaseId: job.currentPhaseId, attempt: req.attempt, role: req.failedRoleId, reason: 'architect_modified_repo', diffSummary: d.summary }
       });
       return { decision: 'deny', notes: 'Architect decision session modified non-engine files; denied.' };
     }
@@ -962,7 +1964,7 @@ export class JobManager {
       });
       await this.ledger.append({
         type: 'scope_exception_denied',
-        data: { jobId: job.jobId, role: req.failedRoleId, reason: 'missing_decision_file', evidencePath }
+        data: { jobId: job.jobId, phaseId: job.currentPhaseId, attempt: req.attempt, role: req.failedRoleId, reason: 'missing_decision_file', evidencePath }
       });
       return { decision: 'deny', notes: `Missing decision file: ${decisionRel}` };
     }
@@ -974,7 +1976,7 @@ export class JobManager {
     if (decision !== 'deny' && decision !== 'grant_narrow_access' && decision !== 'reroute_work' && decision !== 'terminate') {
       await this.ledger.append({
         type: 'scope_exception_denied',
-        data: { jobId: job.jobId, role: req.failedRoleId, reason: 'invalid_decision', decision, evidencePath }
+        data: { jobId: job.jobId, phaseId: job.currentPhaseId, attempt: req.attempt, role: req.failedRoleId, reason: 'invalid_decision', decision, evidencePath }
       });
       return { decision: 'deny', notes: `Invalid decision: ${decision}` };
     }
@@ -982,7 +1984,7 @@ export class JobManager {
     if (decision === 'deny') {
       await this.ledger.append({
         type: 'scope_exception_denied',
-        data: { jobId: job.jobId, role: req.failedRoleId, reason: 'denied', evidencePath, notes: raw?.notes }
+        data: { jobId: job.jobId, phaseId: job.currentPhaseId, attempt: req.attempt, role: req.failedRoleId, reason: 'denied', evidencePath, notes: raw?.notes }
       });
       return { decision: 'deny', notes: raw?.notes };
     }
@@ -991,7 +1993,7 @@ export class JobManager {
       const toRoleId = raw?.toRoleId ? String(raw.toRoleId) : undefined;
       await this.ledger.append({
         type: 'scope_exception_denied',
-        data: { jobId: job.jobId, role: req.failedRoleId, reason: 'reroute_work', toRoleId, evidencePath, notes: raw?.notes }
+        data: { jobId: job.jobId, phaseId: job.currentPhaseId, attempt: req.attempt, role: req.failedRoleId, reason: 'reroute_work', toRoleId, evidencePath, notes: raw?.notes }
       });
       return { decision: 'reroute_work', toRoleId, notes: raw?.notes };
     }
@@ -999,7 +2001,7 @@ export class JobManager {
     if (decision === 'terminate') {
       await this.ledger.append({
         type: 'scope_exception_denied',
-        data: { jobId: job.jobId, role: req.failedRoleId, reason: 'terminated', evidencePath, notes: raw?.notes }
+        data: { jobId: job.jobId, phaseId: job.currentPhaseId, attempt: req.attempt, role: req.failedRoleId, reason: 'terminated', evidencePath, notes: raw?.notes }
       });
       return { decision: 'terminate', notes: raw?.notes };
     }
@@ -1013,7 +2015,7 @@ export class JobManager {
     if (patterns.length === 0) {
       await this.ledger.append({
         type: 'scope_exception_denied',
-        data: { jobId: job.jobId, role: req.failedRoleId, reason: 'missing_patterns', evidencePath }
+        data: { jobId: job.jobId, phaseId: job.currentPhaseId, attempt: req.attempt, role: req.failedRoleId, reason: 'missing_patterns', evidencePath }
       });
       return { decision: 'deny', notes: 'grant_narrow_access requires non-empty patterns[]' };
     }
@@ -1022,6 +2024,8 @@ export class JobManager {
       type: 'scope_exception_granted',
       data: {
         jobId: job.jobId,
+        phaseId: job.currentPhaseId,
+        attempt: req.attempt,
         role: req.failedRoleId,
         kind,
         patterns,
@@ -1051,13 +2055,19 @@ export class JobManager {
     return { decision: 'grant_narrow_access', kind, patterns, ownerRoleId, expiresAfterAttempt, notes: raw?.notes };
   }
 
-  private async escalate(roleId: string, job: JobState, contract: Contract, budgetResult: unknown): Promise<JobOutcome> {
+  private async escalate(
+    roleId: string,
+    job: JobState,
+    contract: Contract,
+    budgetResult: unknown,
+    reason: 'budget_exhausted' | 'repeated_completion_failure' = 'budget_exhausted'
+  ): Promise<JobOutcome> {
     // Rendering hook: escalation
-    this.hooks.onEscalation?.({ roleId, reason: 'budget_exhausted' });
+    this.hooks.onEscalation?.({ roleId, reason });
 
     await this.ledger.append({
       type: 'escalation',
-      data: { jobId: job.jobId, role: roleId, reason: 'budget_exhausted', budget: budgetResult }
+      data: { jobId: job.jobId, role: roleId, reason, budget: budgetResult }
     });
 
     const hasArchitect = contract.roles.some((r) => r.id === 'architect');
@@ -1072,20 +2082,68 @@ export class JobManager {
     job.feedbackByRole.architect = {
       kind: 'resolution_request',
       failedRole: roleId,
-      failedRoleFeedback: job.feedbackByRole[roleId]
+      failedRoleFeedback: job.feedbackByRole[roleId],
+      reason
     };
     await this.persist(job);
 
-    await this.runRoleSession('architect', job, contract);
+    // Budget exhaustion escalations are advisory. Running a normal role session for `architect` would incorrectly
+    // apply the current phase's completion criteria (e.g. diff_non_empty / command_succeeds), causing a guaranteed
+    // failure loop with empty diffs. Instead, request a resolution note in staging and verify by artifact existence.
+    const delegatedTasks = (job.delegationPlan?.tasks ?? []).filter((t) => t.roleId === roleId);
+    const guidance = await this.runEscalationResolutionByArchitect(job, contract, {
+      failedRoleId: roleId,
+      attempt: job.attemptsByRole?.[roleId] ?? 0,
+      event: { type: 'NEEDS_ESCALATION', reason, context: budgetResult } as any,
+      delegatedTasks,
+      implementationPlanRel: null
+    });
+
+    // Make the guidance visible to the failed role for any subsequent recovery flows.
+    job.feedbackByRole ??= {};
+    job.feedbackByRole[roleId] = {
+      kind: 'architect_guidance',
+      event: { type: 'NEEDS_ESCALATION', reason },
+      guidance
+    } as any;
+    await this.persist(job);
 
     job.state = 'failed';
     await this.persist(job);
-    return { ok: false, reason: 'escalated', details: { roleId } };
+    return { ok: false, reason: 'escalated', details: { roleId, guidance } };
   }
 
   private async persist(job: JobState): Promise<void> {
     if (!job.statusPath) return;
     await writeJson(job.statusPath, buildJobStatusSnapshotV1(job));
+  }
+
+  private async persistSessionHeartbeat(job: JobState, lastActivityAtIso: string): Promise<void> {
+    if (!job.sessionActive) return;
+    job.sessionLastActivityAtIso = lastActivityAtIso || job.sessionLastActivityAtIso || new Date().toISOString();
+    await this.persist(job);
+  }
+
+  private async closeSession(job: JobState, handle: SessionHandle | null): Promise<void> {
+    if (handle) {
+      try {
+        await this.sessionController.stopSession(handle);
+      } catch {
+        // best-effort
+      }
+      if (this.activeHandle?.id === handle.id) {
+        this.activeHandle = null;
+      }
+      job.sessionLastActivityAtIso = handle.lastActivityAtIso ?? job.sessionLastActivityAtIso ?? null;
+    } else if (this.activeHandle) {
+      // Defensive: startup failed but an active handle remained set.
+      await this.stopActiveSession();
+    }
+
+    job.sessionActive = false;
+    job.sessionHandleId = null;
+    job.sessionPid = null;
+    await this.persist(job);
   }
 
   private async finalizeForOutcome(job: JobState, out: JobOutcome): Promise<void> {
@@ -1101,10 +2159,59 @@ export class JobManager {
     await this.finalize(job, 'job_failed', { out });
   }
 
+  /**
+   * Best-effort repair for stale/broken git worktrees.
+   *
+   * Failure mode:
+   * - Worktree directory still exists
+   * - Its `.git` file points to `<repoRoot>/.git/worktrees/<jobId>`
+   * - That gitdir was removed → all git commands fail with exit=128
+   *
+   * We repair by moving aside the stale directory and re-adding the worktree for `job.jobBranch`.
+   */
+  private async ensureWorktreeHealthy(job: JobState): Promise<{ repaired: boolean; note?: string }> {
+    const worktreePath = job.worktreePath?.trim();
+    if (!worktreePath) return { repaired: false };
+    const jobBranch = job.jobBranch?.trim();
+    if (!jobBranch) return { repaired: false };
+
+    const inspected = await inspectWorktreeDir(worktreePath);
+    if (inspected.active) return { repaired: false };
+
+    // If the directory exists but is stale, move it aside so `git worktree add` can succeed.
+    if (inspected.exists) {
+      const movedTo = `${worktreePath}.stale-${Date.now()}-${process.pid}`;
+      try {
+        await rename(worktreePath, movedTo);
+      } catch {
+        // Last resort: remove the directory to unblock worktree creation.
+        await rm(worktreePath, { recursive: true, force: true });
+      }
+    }
+
+    // Re-add the worktree for the existing job branch.
+    await addWorktree(git(job.repoRoot), worktreePath, jobBranch);
+
+    const note = inspected.gitdir ? `missing gitdir: ${inspected.gitdir}` : 'missing or unparsable .git file';
+    const evidencePath = await this.evidenceCollector.recordCustomCheck('engine', 'worktree-repaired', {
+      jobId: job.jobId,
+      worktreePath,
+      jobBranch,
+      note,
+      inspected
+    });
+    await this.ledger.append(
+      { type: 'custom_check', data: { kind: 'worktree_repaired', evidencePath, worktreePath, jobBranch, note } } as any
+    );
+
+    return { repaired: true, note };
+  }
+
   private async finalize(job: JobState, type: 'job_completed' | 'job_failed' | 'job_budget_exceeded' | 'job_cancelled', data: unknown): Promise<void> {
     if (this.finalized) return;
     this.finalized = true;
 
+    await this.ensureWorktreeHealthy(job).catch(() => undefined);
     const repo = git(jobWorkspaceRoot(job));
     const [branch, commitHash, files] = await Promise.all([
       getCurrentBranch(repo).catch(() => null),
@@ -1143,34 +2250,58 @@ export class JobManager {
 
     await this.ledger.append({ type: 'session_start', data: { role: roleId, commit: pre, mode: 'plan' } } as any);
 
+    // Allocate a dedicated session log for delegated plan runs so prompts/events
+    // do not bleed into the previous role session log.
+    job.sessionActive = true;
+    job.sessionStartedAtIso = new Date().toISOString();
+    job.sessionHandleId = null;
+    job.sessionPid = null;
+    job.sessionLastActivityAtIso = null;
+    job.sessionSeq = (job.sessionSeq ?? 0) + 1;
+    job.sessionLogPath = `.nibbler/jobs/${job.jobId}/evidence/sessions/${job.sessionSeq}-${roleId}-${job.currentPhaseId}-plan-${req.attempt}.log`;
+    await this.persist(job);
+
     const prompt = [
-      'You are in Cursor PLAN MODE.',
-      '',
-      'Your Architect has delegated tasks to you. Deep-dive into the codebase and produce a detailed implementation plan.',
+      'Your Architect has delegated the tasks below. Review the codebase and write a focused implementation plan.',
+      'Cover each task thoroughly (error handling, edge cases, tests if relevant) but do not add work beyond what the tasks require.',
       '',
       '## Output',
-      `Write your plan to: ${stagedRel}`,
+      `Write your plan to exactly this path: ${stagedRel}`,
+      'The engine will materialize it. If the file is missing at this exact path, the plan step FAILS.',
       '',
       '## Tasks',
       ...req.delegatedTasks.map((t) => `- [${t.taskId}] ${t.description}${t.scopeHints?.length ? ` (scopeHints: ${t.scopeHints.join(', ')})` : ''}`),
       '',
       'Do NOT make code changes. Only write the plan file in the staging path above.',
       '',
-      'When finished, emit:',
-      'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"role plan written"}'
+      'After writing the plan file, signal completion by outputting this as plain text in your response (NOT inside any file):',
+      '',
+      '```',
+      'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"role plan written"}',
+      '```',
+      '',
+      'CRITICAL: The NIBBLER_EVENT line is a protocol signal. NEVER write it into any file.'
     ].join('\n');
 
-    const handle = await this.sessionController.startSession(roleId, job, contract, {
-      mode: 'plan',
-      delegatedTasks: req.delegatedTasks,
-      implementationPlanRel: undefined,
-      bootstrapPrompt: prompt
-    });
-    this.activeHandle = handle;
-    await this.persist(job);
-    await this.sessionController.waitForCompletion(handle, mustRole(contract, roleId).budget);
-    await this.sessionController.stopSession(handle);
-    this.activeHandle = null;
+    let handle: SessionHandle | null = null;
+    try {
+      handle = await this.sessionController.startSession(roleId, job, contract, {
+        mode: 'plan',
+        delegatedTasks: req.delegatedTasks,
+        implementationPlanRel: undefined,
+        bootstrapPrompt: prompt
+      });
+      this.activeHandle = handle;
+      await this.persist(job);
+      await this.sessionController.waitForCompletion(handle, mustRole(contract, roleId).budget, {
+        onHeartbeat: ({ lastActivityAtIso }) => this.persistSessionHeartbeat(job, lastActivityAtIso)
+      });
+    } finally {
+      await this.closeSession(job, handle);
+    }
+
+    // Best-effort: materialize handoff artifact for this plan session too.
+    await this.materializeHandoffBestEffort(job, roleId, job.currentPhaseId).catch(() => undefined);
 
     // Verify: no repo changes outside engine paths.
     const dAll = await diff(repo, pre);
@@ -1190,6 +2321,11 @@ export class JobManager {
 
     await mkdir(dirname(implPlanAbs), { recursive: true });
     await copyFile(stagedAbs, implPlanAbs);
+    // Also materialize into the active session workspace (worktree) so downstream execution sessions
+    // can read it via the same `.nibbler/jobs/<id>/plan/...` relative path.
+    const implPlanAbsInWorkspace = `${jobWorkspaceRoot(job).replace(/\/+$/, '')}/${implPlanRel}`;
+    await mkdir(dirname(implPlanAbsInWorkspace), { recursive: true });
+    await copyFile(stagedAbs, implPlanAbsInWorkspace);
     await this.evidenceCollector.recordCustomCheck(roleId, 'delegated-plan-materialized', {
       from: stagedRel,
       to: implPlanRel,
@@ -1202,6 +2338,37 @@ export class JobManager {
     await this.ledger.append({ type: 'session_complete', data: { role: roleId, outcome: { kind: 'plan_materialized', implPlanRel } } } as any);
 
     return { ok: true, implPlanRel };
+  }
+
+  private async materializeHandoffBestEffort(job: JobState, roleId: string, phaseId: string): Promise<void> {
+    const workspaceRoot = jobWorkspaceRoot(job);
+    const stagedRel = `.nibbler-staging/${job.jobId}/handoffs/${roleId}-${phaseId}.md`;
+    const stagedAbs = `${workspaceRoot.replace(/\/+$/, '')}/${stagedRel}`;
+
+    const exists = await fileExists(stagedAbs);
+    if (!exists) return;
+
+    const outRel = `.nibbler/jobs/${job.jobId}/plan/handoffs/${roleId}-${phaseId}.md`;
+    const outAbsRepoRoot = `${job.repoRoot.replace(/\/+$/, '')}/${outRel}`;
+    const outAbsWorkspace = `${workspaceRoot.replace(/\/+$/, '')}/${outRel}`;
+
+    await mkdir(dirname(outAbsRepoRoot), { recursive: true });
+    await copyFile(stagedAbs, outAbsRepoRoot);
+
+    // Mirror into the active session workspace so downstream roles in the same worktree can read it.
+    await mkdir(dirname(outAbsWorkspace), { recursive: true });
+    await copyFile(stagedAbs, outAbsWorkspace);
+
+    await this.evidenceCollector.recordCustomCheck(roleId, 'handoff-materialized', {
+      from: stagedRel,
+      to: outRel,
+      roleId,
+      phaseId,
+    });
+    await this.ledger.append({
+      type: 'custom_check',
+      data: { kind: 'handoff', passed: true, role: roleId, phaseId, path: outRel }
+    } as any);
   }
 
   private async runEscalationResolutionByArchitect(
@@ -1276,16 +2443,40 @@ export class JobManager {
       '',
       'Do NOT modify repository files. Only write the resolution file in staging.',
       '',
-      'When finished, emit:',
-      'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"architect guidance written"}'
+      'After writing the resolution file, signal completion by outputting this as plain text in your response (NOT inside any file):',
+      '',
+      '```',
+      'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"architect guidance written"}',
+      '```'
     ].join('\n');
 
-    const handle = await this.sessionController.startSession('architect', job, restrictedContract, { mode: 'plan', bootstrapPrompt: prompt });
-    this.activeHandle = handle;
+    const prevRoleId = job.currentRoleId;
+    const prevSessionLogPath = job.sessionLogPath;
+    job.currentRoleId = 'architect';
+    job.sessionActive = true;
+    job.sessionStartedAtIso = new Date().toISOString();
+    job.sessionHandleId = null;
+    job.sessionPid = null;
+    job.sessionLastActivityAtIso = null;
+    job.sessionSeq = (job.sessionSeq ?? 0) + 1;
+    job.sessionLogPath =
+      `.nibbler/jobs/${job.jobId}/evidence/sessions/` +
+      `${job.sessionSeq}-architect-${job.currentPhaseId}-escalation-${req.failedRoleId}-${req.attempt}.log`;
     await this.persist(job);
-    await this.sessionController.waitForCompletion(handle, mustRole(contract, 'architect').budget);
-    await this.sessionController.stopSession(handle);
-    this.activeHandle = null;
+
+    let handle: SessionHandle | null = null;
+    try {
+      handle = await this.sessionController.startSession('architect', job, restrictedContract, { mode: 'plan', bootstrapPrompt: prompt });
+      this.activeHandle = handle;
+      await this.sessionController.waitForCompletion(handle, mustRole(contract, 'architect').budget, {
+        onHeartbeat: ({ lastActivityAtIso }) => this.persistSessionHeartbeat(job, lastActivityAtIso)
+      });
+    } finally {
+      await this.closeSession(job, handle);
+      job.currentRoleId = prevRoleId;
+      job.sessionLogPath = prevSessionLogPath;
+      await this.persist(job);
+    }
 
     // Enforce: architect should not modify repo (outside engine paths).
     const dAll = await diff(repo, pre);
@@ -1308,6 +2499,11 @@ export class JobManager {
 
     await mkdir(dirname(resolutionAbs), { recursive: true });
     await copyFile(resolutionStagedAbs, resolutionAbs);
+    // Also materialize into the active session workspace (worktree) so the failed role can read it
+    // by relative path during retries or recovery.
+    const resolutionAbsInWorkspace = `${jobWorkspaceRoot(job).replace(/\/+$/, '')}/${resolutionRel}`;
+    await mkdir(dirname(resolutionAbsInWorkspace), { recursive: true });
+    await copyFile(resolutionStagedAbs, resolutionAbsInWorkspace);
     await this.evidenceCollector.recordCustomCheck('architect', 'escalation-resolution-materialized', {
       from: resolutionStagedRel,
       to: resolutionRel
@@ -1319,6 +2515,275 @@ export class JobManager {
 
     return { ok: true, resolutionRel };
   }
+}
+
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    await stat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readWorktreeGitdir(worktreePath: string): Promise<string | null> {
+  try {
+    const raw = await readFile(join(worktreePath, '.git'), 'utf8');
+    const m = /^gitdir:\s*(.+)\s*$/m.exec(raw);
+    if (!m) return null;
+    const candidate = m[1].trim();
+    // git may write either absolute or relative paths here
+    return resolvePath(worktreePath, candidate);
+  } catch {
+    return null;
+  }
+}
+
+async function inspectWorktreeDir(
+  worktreePath: string
+): Promise<{ exists: boolean; active: boolean; gitdir: string | null; gitdirExists: boolean }> {
+  const exists = await pathExists(worktreePath);
+  if (!exists) return { exists: false, active: false, gitdir: null, gitdirExists: false };
+  const gitdir = await readWorktreeGitdir(worktreePath);
+  const gitdirExists = gitdir ? await pathExists(gitdir) : false;
+  return { exists: true, active: !!gitdir && gitdirExists, gitdir, gitdirExists };
+}
+
+function jobLedgerPathAbs(job: JobState): string {
+  return `${job.repoRoot.replace(/\/+$/, '')}/.nibbler/jobs/${job.jobId}/ledger.jsonl`;
+}
+
+function buildAttemptSummary(args: {
+  attempt: number;
+  scope: ScopeResult;
+  completion: CompletionResult;
+  isEmptyDiff: boolean;
+}): SessionFeedbackSummaryV1 {
+  const scopeViolations = args.scope.violations ?? [];
+  const sampleViolations = scopeViolations.slice(0, 10).map((v) => v.file);
+  const failedCriteria = (args.completion.criteriaResults ?? [])
+    .filter((r) => !r.passed)
+    .map((r) => r.message);
+
+  const summary: SessionFeedbackSummaryV1 = {
+    attempt: args.attempt,
+    scope: {
+      passed: args.scope.passed,
+      violationCount: scopeViolations.length,
+      ...(sampleViolations.length ? { sampleViolations } : {}),
+    },
+    completion: {
+      passed: args.completion.passed,
+      ...(failedCriteria.length ? { failedCriteria } : {}),
+    },
+  };
+
+  const hint = detectEngineHint({
+    attempt: args.attempt,
+    isEmptyDiff: args.isEmptyDiff,
+    scope: args.scope,
+    completion: args.completion,
+  });
+  if (hint) summary.engineHint = hint;
+
+  return summary;
+}
+
+function detectEngineHint(args: {
+  attempt: number;
+  isEmptyDiff: boolean;
+  scope: ScopeResult;
+  completion: CompletionResult;
+}): string | undefined {
+  if (args.isEmptyDiff) {
+    return (
+      'Session produced no file changes (0 files modified). This is the #1 cause of retries. ' +
+      'You MUST create or modify files to satisfy diff_non_empty and delegation_coverage. ' +
+      'WRITE FILES FIRST before running any test or validation commands. ' +
+      'Follow this exact order: 1) Read your implementation plan, 2) Write/create ALL source files, 3) Run npm install if needed, 4) Run tests/build to validate. ' +
+      'If code already exists and seems correct, make a meaningful improvement (better types, explicit qualifiers, documentation, additional edge cases). ' +
+      'Do NOT spend time only reading files or running tests — your session will timeout with 0 changes.'
+    );
+  }
+
+  const failedCriteria = (args.completion.criteriaResults ?? [])
+    .filter((r) => !r.passed)
+    .map((r) => r.message);
+
+  const violations = args.scope.violations ?? [];
+  const outOfScope = violations.filter((v) => v.reason === 'out_of_scope').slice(0, 10).map((v) => v.file);
+  const protectedPaths = violations.filter((v) => v.reason === 'protected_path').slice(0, 10).map((v) => v.file);
+
+  if (args.scope.passed && !args.completion.passed) {
+    const smokeFailure = (args.completion.criteriaResults ?? []).find(
+      (r) => !r.passed && typeof r.message === 'string' && r.message.startsWith('local_http_smoke(')
+    ) as { message: string; evidence?: Record<string, unknown> } | undefined;
+    if (smokeFailure) {
+      const ev = smokeFailure.evidence ?? {};
+      const startCommand = typeof ev.startCommand === 'string' ? ev.startCommand : null;
+      const configuredUrl = typeof ev.url === 'string' ? ev.url : null;
+      const resolvedUrl = typeof ev.resolvedUrl === 'string' ? ev.resolvedUrl : null;
+      const status = typeof ev.httpStatus === 'number' ? ev.httpStatus : null;
+      const lastError = typeof ev.lastError === 'string' ? ev.lastError : null;
+      const statusDetail = status != null ? `HTTP ${status}` : lastError ? lastError : 'no HTTP response';
+      const commandDetail = startCommand ? ` Start command: \`${startCommand}\`.` : '';
+      const urlDetail = configuredUrl
+        ? ` Probe target: \`${configuredUrl}\`${resolvedUrl ? ` (resolved candidate: \`${resolvedUrl}\`)` : ''}.`
+        : '';
+      return (
+        `local_http_smoke keeps failing (${statusDetail}).` +
+        urlDetail +
+        commandDetail +
+        ' Ensure the dev server serves the app root with a 2xx response at the smoke URL. ' +
+        'If the project lives in a subfolder (for example Vite in `frontend/`), set the correct root (`--root frontend` or `root` in vite config).'
+      );
+    }
+
+    // Special-case: planning delegation failures need concrete next steps.
+    const delegation = (args.completion.criteriaResults ?? []).find((r) => r.message === 'delegation plan invalid');
+    const delegationErrors = (delegation as any)?.evidence?.errors;
+    if (delegation && Array.isArray(delegationErrors) && delegationErrors.length > 0) {
+      const top = delegationErrors.slice(0, 2).map((e: any) => String(e?.message ?? '').trim()).filter(Boolean);
+      const detail = top.length ? ` Example: ${top.join(' | ')}` : '';
+      return (
+        'Delegation plan is invalid. Fix tasks[].scopeHints so every hint matches the assigned role scope (or shared scope) in `.nibbler/contract/team.yaml`.' +
+        detail
+      );
+    }
+    const crit = failedCriteria.length ? `: ${failedCriteria.slice(0, 5).join(' | ')}` : '';
+    return `Scope was correct. Focus on meeting completion criteria${crit}.`;
+  }
+
+  if (!args.scope.passed && args.completion.passed) {
+    const parts: string[] = [];
+    if (outOfScope.length) parts.push(`out-of-scope files: ${outOfScope.map((p) => `\`${p}\``).join(', ')}`);
+    if (protectedPaths.length) parts.push(`protected paths: ${protectedPaths.map((p) => `\`${p}\``).join(', ')}`);
+    const detail = parts.length ? ` (${parts.join('; ')})` : '';
+    return `Your changes met completion criteria but violated scope${detail}. Restrict changes to your declared scope or request a narrow scope exception.`;
+  }
+
+  if (!args.scope.passed && !args.completion.passed) {
+    return 'Both scope and completion failed. Fix scope first, then re-run completion checks; review attempt history for what worked previously.';
+  }
+
+  return undefined;
+}
+
+function buildPromptRetryFeedbackLines(feedback: unknown): string[] {
+  if (!feedback || typeof feedback !== 'object') return [];
+  const fb = feedback as Record<string, any>;
+  const lines: string[] = [
+    '## Retry feedback from engine (highest priority)',
+    '- Apply this feedback before making new changes.'
+  ];
+
+  const rawHint = typeof fb.engineHint === 'string' ? fb.engineHint : '';
+  const hint = rawHint.replace(/\s+/g, ' ').trim();
+  if (hint) lines.push(`- ${hint}`);
+
+  if (fb.kind === 'session_protocol_missing') {
+    lines.push('- Previous attempt exited without a protocol completion signal.');
+    lines.push('- End your final response with exactly one line like: `NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"..."}`.');
+  }
+
+  if (fb.kind === 'session_process_exit') {
+    const code = fb.exitCode ?? 'null';
+    const signal = fb.signal ?? 'null';
+    lines.push(`- Previous attempt exited unexpectedly (exitCode=${code}, signal=${signal}).`);
+    lines.push('- Keep changes scoped and incremental; write files first, then run validations, then emit NIBBLER_EVENT.');
+  }
+
+  const sampleViolations = Array.isArray(fb.scope?.sampleViolations)
+    ? fb.scope.sampleViolations
+        .filter((v: unknown): v is string => typeof v === 'string' && v.trim().length > 0)
+        .slice(0, 8)
+    : [];
+  const scopeViolations = Array.isArray(fb.scope?.violations)
+    ? fb.scope.violations
+        .map((v: any) => (typeof v?.file === 'string' ? v.file : ''))
+        .filter((v: string) => v.trim().length > 0)
+        .slice(0, 8)
+    : [];
+  const recentViolationFiles = sampleViolations.length > 0 ? sampleViolations : scopeViolations;
+  const grantedScopePatterns = extractGrantedScopePatterns(fb);
+  const grantedMatcher = grantedScopePatterns.length > 0 ? picomatch(grantedScopePatterns, { dot: true }) : null;
+  const grantedViolationFiles =
+    grantedMatcher == null ? [] : recentViolationFiles.filter((p: string) => grantedMatcher(p));
+  const blockedViolationFiles =
+    grantedMatcher == null ? recentViolationFiles : recentViolationFiles.filter((p: string) => !grantedMatcher(p));
+  if (recentViolationFiles.length > 0) {
+    lines.push(`- Recent out-of-scope files: ${recentViolationFiles.map((p: string) => `\`${p}\``).join(', ')}`);
+    if (grantedViolationFiles.length > 0) {
+      lines.push(
+        `- Architect granted narrow scope access for: ${grantedViolationFiles.map((p: string) => `\`${p}\``).join(', ')}.`
+      );
+    }
+    if (blockedViolationFiles.length > 0) {
+      lines.push(
+        `- HARD blocklist for this retry: do NOT edit ${blockedViolationFiles.map((p: string) => `\`${p}\``).join(', ')}.`
+      );
+      lines.push('- If these files are required to proceed, emit `NIBBLER_EVENT {"type":"NEEDS_ESCALATION",...}` instead of editing them.');
+    }
+  }
+
+  const failedCriteria = Array.isArray(fb.completion?.failedCriteria)
+    ? fb.completion.failedCriteria
+        .filter((v: unknown): v is string => typeof v === 'string' && v.trim().length > 0)
+        .slice(0, 6)
+    : [];
+  if (failedCriteria.length > 0) {
+    lines.push(`- Previously failed criteria: ${failedCriteria.map((c: string) => `\`${c}\``).join(', ')}`);
+  }
+
+  const failedResults = Array.isArray(fb.completion?.criteriaResults)
+    ? fb.completion.criteriaResults.filter((r: any) => r && r.passed === false)
+    : [];
+  const smokeFailure = failedResults.find(
+    (r: any) => typeof r?.message === 'string' && r.message.startsWith('local_http_smoke(')
+  );
+  if (smokeFailure && smokeFailure.evidence && typeof smokeFailure.evidence === 'object') {
+    const ev = smokeFailure.evidence as Record<string, unknown>;
+    const startCommand = typeof ev.startCommand === 'string' ? ev.startCommand : null;
+    const configuredUrl = typeof ev.url === 'string' ? ev.url : null;
+    const resolvedUrl = typeof ev.resolvedUrl === 'string' ? ev.resolvedUrl : null;
+    const httpStatus = typeof ev.httpStatus === 'number' ? ev.httpStatus : null;
+    const lastError = typeof ev.lastError === 'string' ? ev.lastError : null;
+    const stdoutTail = typeof ev.stdoutTail === 'string' ? ev.stdoutTail : '';
+    const discoveredUrl = (() => {
+      const m = /(https?:\/\/(?:localhost|127\.0\.0\.1):\d{2,5})/i.exec(stdoutTail);
+      return m?.[1] ?? null;
+    })();
+
+    if (startCommand) lines.push(`- local_http_smoke start command: \`${startCommand}\``);
+    if (configuredUrl || resolvedUrl || discoveredUrl) {
+      lines.push(
+        `- local_http_smoke URLs: configured=${configuredUrl ? `\`${configuredUrl}\`` : 'n/a'}, resolved=${resolvedUrl ? `\`${resolvedUrl}\`` : discoveredUrl ? `\`${discoveredUrl}\`` : 'n/a'}`
+      );
+    }
+    if (httpStatus != null) {
+      lines.push(`- local_http_smoke received HTTP ${httpStatus}; check server root/path so the smoke URL returns 2xx.`);
+    } else if (lastError) {
+      lines.push(`- local_http_smoke last error: ${lastError}`);
+    }
+  }
+
+  const hasSessionSignalFeedback = fb.kind === 'session_protocol_missing' || fb.kind === 'session_process_exit';
+  if (!hint && recentViolationFiles.length === 0 && failedCriteria.length === 0 && !hasSessionSignalFeedback) return [];
+  lines.push('- Keep changes minimal and strictly inside your allowed scope.');
+  return lines;
+}
+
+function extractGrantedScopePatterns(feedback: Record<string, any>): string[] {
+  const decision = feedback.scopeDecision;
+  if (!decision || typeof decision !== 'object') return [];
+  if ((decision as any).decision !== 'grant_narrow_access') return [];
+
+  const patterns: unknown[] = Array.isArray((decision as any).patterns) ? (decision as any).patterns : [];
+  return patterns
+    .filter((p: unknown): p is string => typeof p === 'string')
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .slice(0, 32);
 }
 
 function resolveDelegation(tasks: DelegationTask[]): { roleOrder: string[]; tasksByRole: Map<string, DelegationTask[]> } {
@@ -1414,7 +2879,24 @@ function findStartPhaseId(contract: Contract): string | null {
   return starts.length ? starts[0] : null;
 }
 
+function phaseExists(contract: Contract, phaseId: string): boolean {
+  return contract.phases.some((p) => p.id === phaseId);
+}
+
+function normalizeTransitionTarget(target: string, contract: Contract): string {
+  const t = String(target ?? '').trim();
+  if (!t) return t;
+  if (t === '__END__') return '__END__';
+  if (phaseExists(contract, t)) return t;
+
+  // Compatibility: older/generated contracts may encode terminal outcomes as "completed".
+  const normalized = t.toLowerCase();
+  if (normalized === 'completed' || normalized === 'complete' || normalized === 'done' || normalized === 'success') {
+    return '__END__';
+  }
+  return t;
+}
+
 function jobWorkspaceRoot(job: JobState): string {
   return job.worktreePath ?? job.repoRoot;
 }
-

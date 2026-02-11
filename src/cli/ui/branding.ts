@@ -1,5 +1,6 @@
 import chalk from 'chalk';
 import { theme } from './theme.js';
+import type { Contract, Criterion } from '../../core/contract/types.js';
 
 // ── Brand Identity ──────────────────────────────────────────────────────────
 
@@ -103,11 +104,7 @@ export function workspaceSummary(info: {
 /**
  * Contract summary for init approval — displayed in a box.
  */
-export function contractSummary(contract: {
-  roles: Array<{ id: string; scope: string[] }>;
-  phases: Array<{ id: string; isTerminal?: boolean }>;
-  gates: Array<{ id: string; audience: string; trigger: string }>;
-}): string {
+export function contractSummary(contract: Contract): string {
   const lines: string[] = [];
 
   // Roles
@@ -118,7 +115,16 @@ export function contractSummary(contract: {
     const scopeStr = role.scope.length <= 3
       ? role.scope.join(', ')
       : `${role.scope.slice(0, 2).join(', ')} +${role.scope.length - 2} more`;
+    const expectations = role.outputExpectations ?? [];
+    const expStr = expectations.length
+      ? (() => {
+          const head = expectations[0] ?? '';
+          const extra = expectations.length > 1 ? ` +${expectations.length - 1} more` : '';
+          return `${truncate(head, 44)}${extra}`;
+        })()
+      : '';
     lines.push(`  ${roleColor(theme.bold(role.id.padEnd(maxRoleLen + 2)))}${theme.dim(scopeStr)}`);
+    if (expStr) lines.push(`    ${theme.dim('expects:')} ${theme.dim(expStr)}`);
   }
 
   lines.push('');
@@ -130,13 +136,73 @@ export function contractSummary(contract: {
 
   lines.push('');
 
+  // Phase details: actors + acceptance criteria (brief)
+  lines.push(theme.bold('Phase Details'));
+  for (const p of contract.phases) {
+    const actors = p.actors.join(', ');
+    const criteria = (p.completionCriteria ?? [])
+      .map(formatCriterionBrief)
+      .slice(0, 3);
+    const criteriaStr = criteria.length ? criteria.join('; ') : '(none)';
+    const terminal = p.isTerminal ? theme.dim(' (terminal)') : '';
+    lines.push(`  ${theme.bold(truncate(p.id, 12).padEnd(14))}${theme.dim(`actors=[${truncate(actors, 34)}]`)}${terminal}`);
+    lines.push(`    ${theme.dim('criteria:')} ${theme.dim(truncate(criteriaStr, 46))}`);
+  }
+
+  lines.push('');
+
   // Gates
   if (contract.gates.length > 0) {
     lines.push(theme.bold('Gates'));
     for (const gate of contract.gates) {
-      lines.push(`  ${theme.bold(gate.id.padEnd(8))}(${gate.audience})   ${theme.dim(gate.trigger)}`);
+      lines.push(`  ${theme.bold(gate.id.padEnd(8))}(${String(gate.audience)})   ${theme.dim(gate.trigger)}`);
+      const inputs = (gate.requiredInputs ?? [])
+        .filter((i) => i.kind === 'path')
+        .map((i) => i.value);
+      if (inputs.length) {
+        const short = inputs.length <= 3 ? inputs.join(', ') : `${inputs.slice(0, 2).join(', ')} +${inputs.length - 2} more`;
+        lines.push(`    ${theme.dim('inputs:')} ${theme.dim(truncate(short, 46))}`);
+      }
+      const approve = gate.outcomes?.approve ? String(gate.outcomes.approve) : '';
+      const reject = gate.outcomes?.reject ? String(gate.outcomes.reject) : '';
+      if (approve || reject) {
+        const mapping = `${approve ? `approve→${approve}` : ''}${approve && reject ? '  ' : ''}${reject ? `reject→${reject}` : ''}`.trim();
+        lines.push(`    ${theme.dim('outcomes:')} ${theme.dim(truncate(mapping, 46))}`);
+      }
     }
   }
 
   return lines.join('\n');
+}
+
+function truncate(text: string, max: number): string {
+  const s = String(text ?? '');
+  if (s.length <= max) return s;
+  if (max <= 1) return s.slice(0, max);
+  return s.slice(0, max - 1) + '…';
+}
+
+function formatCriterionBrief(c: Criterion): string {
+  switch (c.type) {
+    case 'artifact_exists':
+      return `artifact:${c.pattern}`;
+    case 'command_succeeds':
+      return `cmd_ok:${truncate(c.command, 24)}`;
+    case 'command_fails':
+      return `cmd_fail:${truncate(c.command, 22)}`;
+    case 'local_http_smoke':
+      return `http:${truncate(c.url, 26)}`;
+    case 'diff_non_empty':
+      return 'diff_non_empty';
+    case 'markdown_has_headings':
+      return `md:${c.path}`;
+    case 'delegation_coverage':
+      return 'delegation_coverage';
+    case 'diff_within_budget':
+      return `diff_budget`;
+    case 'custom':
+      return 'custom_check';
+    default:
+      return String((c as any).type ?? 'criterion');
+  }
 }

@@ -62,6 +62,7 @@ Authority is distributed across three actors with clear boundaries:
 - **Authority over:** Technical decisions — architecture, task decomposition, delegation, verification methods, code review.
 - **Active during:** Discovery (as interviewer/advisor — proposes, PO decides), planning (full authority to decompose and delegate), execution (review and technical escalation resolution), init (proposes the governance contract).
 - **Cannot:** Bypass PO gates, approve its own SHIP gate, modify meta-rules.
+- **Reliability default:** The Architect should typically have **broad write access** via `authority.allowedPaths` to avoid scope-violation retries during scaffold/triage. This must *not* be expressed as `scope: ["**/*"]` (which would violate overlap rules); see Rule 1.3 and Section 8 (Contract).
 
 ### 3.3. Worker Roles (AI Agents)
 
@@ -103,7 +104,7 @@ Any entity that performs work must have a scope declaration in the contract that
 **Rule 1.2 — Work must not exceed the actor's declared scope.**
 After a session produces changes, the actual git diff must fall within that actor's declared scope. The contract defines scope boundaries; the engine verifies compliance post-hoc.
 
-*Engine enforcement:* After every session, diff the working tree against the pre-session commit. Check every changed file path against the role's declared scope. Violations trigger rejection, revert, and feedback or escalation per the contract's rules.
+*Engine enforcement:* After every session, diff the working tree against the pre-session commit. Check every changed file path against the role's **effective write set**: `role.scope` + declared `sharedScopes` + `role.authority.allowedPaths`, minus protected paths. Violations trigger rejection, revert, and feedback or escalation per the contract's rules.
 
 **Rule 1.3 — Scope overlaps must be explicitly declared.**
 If two roles can affect the same paths, those paths must be declared as shared scope in the contract. Undeclared overlaps are a contract validation error. With sequential execution, no conflict resolution strategy is required — just declaration and awareness.
@@ -502,6 +503,7 @@ The engine enforces a set of paths that no agent session can modify, regardless 
 
 - `.nibbler/` — ledger, evidence, job state, contract
 - `.cursor/rules/00-nibbler-protocol.mdc` — base protocol rules
+- `.git/` — git internals (including worktree metadata)
 - Any path the engine uses for governance
 
 These exclusions are meta-rule enforced (Rule 5.3) and cannot be overridden by the contract.
@@ -554,6 +556,11 @@ At `nibbler init`, the engine validates the Architect's proposed contract agains
 
 If validation fails, the engine returns specific errors to the Architect for correction. This loop is autonomous — the PO is not involved until the contract validates.
 
+**Important note on “open Architect scope”:**
+- Use `authority.allowedPaths: ["**/*"]` for broad Architect write access.
+- Do **not** use `scope: ["**/*"]` (it will create undeclared overlaps with other roles and fail Rule 1.3 validation).
+- Protected paths remain non-negotiable (Rule 5.3), even with broad `allowedPaths`.
+
 ### 8.4. Contract Evolution
 
 The contract can be updated after initialization via `nibbler init --review`. This is useful when:
@@ -579,29 +586,39 @@ nibbler init
   │
   ├─ 1. Read project state
   │     ├─ Existing contract? (update mode)
-  │     ├─ Existing architecture.md? (inform role/scope proposals)
+  │     ├─ Existing vision.md / architecture.md? (discovery may be skipped)
   │     ├─ Existing codebase? (infer structure)
   │     └─ Classify: greenfield vs. existing
   │
-  ├─ 2. Start Architect session with bootstrap context
+  ├─ 2. Discovery (only if vision.md or architecture.md is missing)
+  │     ├─ Ingest provided materials (`--file`, repeatable)
+  │     ├─ Adaptive interview (agent emits QUESTIONS, PO answers via CLI prompts)
+  │     ├─ Writes vision.md + architecture.md (preserving on-disk casing)
+  │     └─ Artifact quality heuristics
+  │           ├─ Sufficient → continue
+  │           ├─ Insufficient → decision: rediscover | continue | abort
+  │           └─ Optional: propose improvements and ask to apply them
+  │
+  ├─ 3. Start Architect session with bootstrap context
   │     ├─ Meta-rules (the constitution — what the contract must satisfy)
-  │     ├─ Project context (whatever exists)
+  │     ├─ Project context (codebase + vision.md + architecture.md)
+  │     ├─ Example contracts (templates) + artifact-quality summary
   │     └─ Init mandate: "Propose a governance contract for this project"
   │
-  ├─ 3. Architect proposes contract
-  │     ├─ Role definitions (team composition, scopes, authority)
+  ├─ 4. Architect proposes contract (iterative)
+  │     ├─ Role definitions (team composition, scopes, authority, budgets)
   │     ├─ Phase definitions (workflow, transitions, completion criteria)
-  │     ├─ Gate definitions (when PO is consulted, what they see)
-  │     ├─ Budget parameters
-  │     └─ Base cursor rules (protocol, methodology rules)
+  │     ├─ Gate definitions (audience, inputs, outcomes)
+  │     └─ Cursor session profiles (permissions per role)
   │
-  ├─ 4. Engine validates against meta-rules
+  ├─ 5. Engine validates against meta-rules (loop until valid or budget exhausted)
   │     ├─ Pass → present to PO for confirmation
   │     └─ Fail → loop Architect with specific errors
   │
-  └─ 5. PO confirms → contract committed
-        ├─ contracts/ files written to repo
-        ├─ .cursor/rules/ base rules written
+  └─ 6. PO confirms → contract + profiles committed
+        ├─ .nibbler/contract/* written to repo
+        ├─ .nibbler/config/cursor-profiles/* written to repo
+        ├─ .cursor/rules/00-nibbler-protocol.mdc written to repo
         └─ Ready for nibbler build
 ```
 
@@ -609,12 +626,15 @@ nibbler init
 
 Written into the target repository:
 
-- `contracts/team.yaml` (or equivalent) — role definitions, scopes, authority
-- `contracts/phases.yaml` (or equivalent) — phase graph, transitions, gates
+- `vision.md` — product vision (discovery output; created if missing)
+- `architecture.md` — technical architecture (discovery output; created if missing)
+- `.nibbler/contract/team.yaml` — role definitions, scopes, authority, budgets
+- `.nibbler/contract/phases.yaml` — phase graph, transitions, gates, criteria
+- `.nibbler/contract/project-profile.yaml` — scan/classification signals used during init
 - `.cursor/rules/00-nibbler-protocol.mdc` — base protocol rules
-- `.cursor/rules/10-*.mdc` — methodology rules (TDD, or whatever the Architect proposes)
+- `.nibbler/config/cursor-profiles/<role>/cli-config.json` — per-role Cursor permissions profiles
 
-The specific file names and formats are **Architect-proposed**. The engine validates structural properties, not naming conventions.
+The contract format is validated by the engine and enforced at runtime. Contract and profile files are committed; staging and per-job evidence are gitignored.
 
 ---
 
@@ -624,26 +644,31 @@ The specific file names and formats are **Architect-proposed**. The engine valid
 
 ```
 1. nibbler init
-   → Architect proposes contract → engine validates → PO confirms
-   → Contract committed to repo
-
-2. nibbler build "requirement" (or --file prd.md)
    │
-   ├─ DISCOVERY
-   │   → Ingest provided materials
-   │   → Classify project type
-   │   → Adaptive interview (Tier 1 → 2 → 3)
-   │   → Synthesize vision.md
-   │   → Generate or reconcile architecture.md
-   │   → PO confirms vision
+   ├─ DISCOVERY (only if vision.md / architecture.md missing; unless --skip-discovery)
+   │   → Ingest provided materials (--file ...)
+   │   → Adaptive interview (questions via CLI prompts)
+   │   → Write vision.md + architecture.md
+   │   → Artifact quality heuristics (optional rediscover / improve / abort)
+   │
+   └─ CONTRACT
+       → Architect proposes contract → engine validates → PO confirms
+       → Contract + profiles committed to repo
+
+2. nibbler build "requirement"
+   │
+   ├─ PRE-FLIGHT
+   │   → Require clean working tree
+   │   → Require .nibbler/contract + vision.md + architecture.md
+   │   → Create job branch + worktree; init evidence + ledger
    │
    ├─ PLANNING
-   │   → Architect session: consumes vision.md + architecture.md + contract
+   │   → Architect session consumes vision.md + architecture.md + contract
    │   → Produces planning artifacts (acceptance, test plan, delegation, risk)
    │   → Engine validates delegation against contract
-   │   → PO GATE: PLAN
+   │   → PO gate(s) as declared in the contract (commonly PLAN)
    │
-   ├─ SCAFFOLD (if repo has no structure)
+   ├─ SCAFFOLD (if included by contract)
    │   → Architect session creates project boilerplate
    │   → Based on architecture.md as source of truth
    │   → Committed on branch before worker execution
@@ -662,6 +687,7 @@ The specific file names and formats are **Architect-proposed**. The engine valid
        → All verifications pass
        → Architect approves
        → PO GATE: SHIP
+       → Recommended default: a docs-focused SHIP step updates `README.md` (install/quickstart/commands/etc.) and is checked deterministically (e.g., required headings + minimum length)
        → Output: branch with linear commit history + evidence + rollback notes
 ```
 
@@ -692,14 +718,22 @@ During any phase, agents may need additional context:
 ### 11.1. Commands
 
 - **`nibbler init`** — Generate or review the project's governance contract.
+  - `--file <path>` — Input document for discovery (repeatable).
   - `--review` — Re-evaluate and update an existing contract.
+  - `--skip-discovery` — Skip discovery (requires existing vision.md + architecture.md).
   - `--dry-run` — Preview proposed contract changes without committing.
 
-- **`nibbler build "<requirement>"`** — Run a full job: discovery → plan → execute → ship.
-  - `--file <path>` — Provide input documents (PRD, specs, etc.). Multiple allowed.
-  - `--dry-run` — Run through discovery and planning, show what would be executed, without running any role sessions.
+- **`nibbler build "<requirement>"`** — Run a full job: plan → execute → ship (as defined by the contract phase graph).
+  - `--file <path>` — Accepted (repeatable). Currently reserved; discovery inputs are handled by `nibbler init --file`.
+  - `--dry-run` — Print the contract-defined execution plan summary (no agent sessions run).
+  - `--skip-scaffold` — Accepted. Currently a hint; scaffolding is controlled by the contract phases.
 
-Build is the single entrypoint: on failure, the engine performs autonomous recovery (Architect-first) and prompts the user only as a last resort.
+Build is the single entrypoint for job execution: on failure, the engine performs autonomous recovery (Architect-first) and prompts the user only as a last resort.
+
+- **`nibbler fix [instructions]`** — Run a fix flow on top of an existing job.
+  - Job selection is interactive by default, or explicit via `--job <id>`.
+  - Fix instructions can be provided as a positional string, via `--file <path>`, or via prompt (interactive).
+  - The fix flow runs as a new job (new worktree + branch) based on the selected job’s output, and merges back when safe.
 
 - **`nibbler status [job-id]`** — Show current phase, active role, last events, progress.
 
@@ -713,8 +747,10 @@ Build is the single entrypoint: on failure, the engine performs autonomous recov
 
 Gates are presented in the CLI as interactive prompts. The PO sees:
 
-- A summary of what's being approved (scope, impact, risks)
-- Links to the relevant artifacts for detailed review
+- **Team context** (roles + scopes)
+- **Transition/outcomes** (what approve/reject will do)
+- **Acceptance criteria** (phase completion criteria, deterministically enforced)
+- **Relevant artifacts** (required inputs with previews and a drill-down viewer)
 - Clear options: approve, reject (with reason), or request changes
 
 Gate responses are recorded in the ledger.
@@ -798,6 +834,7 @@ Append-only record of all decisions, events, and state transitions. Each entry i
     <job-id>/
       plan/                        # planning artifacts
       evidence/                    # verification outputs
+        sessions/                  # raw Cursor session logs (durable, per role/attempt)
       ledger.jsonl                 # append-only decision log
       status.json                  # current job state
 

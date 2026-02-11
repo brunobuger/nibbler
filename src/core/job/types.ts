@@ -7,6 +7,14 @@ export interface SessionUsage {
   diffLines: number;
 }
 
+export interface SessionFeedbackSummaryV1 {
+  attempt: number;
+  scope: { passed: boolean; violationCount?: number; sampleViolations?: string[] };
+  completion: { passed: boolean; failedCriteria?: string[] };
+  scopeDecision?: { decision: string; patterns?: string[]; notes?: string };
+  engineHint?: string;
+}
+
 export type JobMode = 'build' | 'fix' | 'resume';
 
 export type JobStatus =
@@ -64,6 +72,11 @@ export interface JobState {
   currentRoleId?: string | null;
   statusPath?: string;
   feedbackByRole?: Record<string, unknown>;
+  /**
+   * Per-role, cross-attempt summary feedback. This is a compact, agent-friendly digest
+   * of deterministic verification outcomes; full evidence is persisted separately.
+   */
+  feedbackHistoryByRole?: Record<string, SessionFeedbackSummaryV1[]>;
   attemptsByRole?: Record<string, number>;
 
   // Phase 10 — observability + UX.
@@ -74,6 +87,7 @@ export interface JobState {
   sessionActive?: boolean;
   sessionHandleId?: string | null;
   sessionPid?: number | null;
+  sessionSeq?: number;
   sessionLogPath?: string | null;
   sessionStartedAtIso?: string | null;
   sessionLastActivityAtIso?: string | null;

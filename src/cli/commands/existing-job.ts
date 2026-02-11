@@ -14,6 +14,7 @@ import { LedgerWriter } from '../../core/ledger/writer.js';
 import { readContract } from '../../core/contract/reader.js';
 import type { Contract } from '../../core/contract/types.js';
 import type { JobState } from '../../core/job/types.js';
+import { readDelegationPlanYaml } from '../../core/delegation/parser.js';
 import { initJob, initWorkspace } from '../../workspace/layout.js';
 import { git, isClean, resolveWorktreePath } from '../../git/operations.js';
 
@@ -24,6 +25,7 @@ import { installCliCancellation } from '../cancel.js';
 import { roleLabel } from '../ui/format.js';
 import type { SpinnerHandle } from '../ui/spinner.js';
 import { cleanupJobWorktreeBestEffort, ensureWorktreeForExistingBranch, mergeBackIfSafe } from '../worktrees.js';
+import { resolveSessionInactivityTimeoutMs } from '../session-timeout.js';
 
 export interface RunExistingJobArgs {
   repoRoot?: string;
@@ -105,11 +107,6 @@ export async function runExistingJob(args: RunExistingJobArgs): Promise<{ ok: bo
     if (state === 'budget_exceeded') return { ok: false, jobId, details: 'Job exceeded budget (cannot resume automatically).' };
   }
 
-  const repo = git(repoRoot);
-  if (!(await isClean(repo, { ignoreNibblerEngineArtifacts: true }))) {
-    return { ok: false, jobId, details: 'Working tree is not clean. Clean/stash changes before resuming a job.' };
-  }
-
   r.info(`Continuing job ${theme.bold(jobId)} from phase ${theme.bold(status.current_phase ?? 'start')}...`);
 
   const jobBranch = status.job_branch ? String(status.job_branch) : null;
@@ -117,6 +114,23 @@ export async function runExistingJob(args: RunExistingJobArgs): Promise<{ ok: bo
   const statusWorktree = status.worktree_path ? String(status.worktree_path) : null;
 
   const worktreePath = jobBranch ? (statusWorktree ?? resolveWorktreePath(repoRoot, jobId)) : null;
+  // If the job has a dedicated worktree, we can safely resume even if the user's
+  // main working tree has local changes. We only require cleanliness when we
+  // must run sessions directly in the repo root (rare for build jobs).
+  const repo = git(repoRoot);
+  const needsRepoRootSessions = !worktreePath;
+  if (needsRepoRootSessions) {
+    if (!(await isClean(repo, { ignoreNibblerEngineArtifacts: true }).catch(() => false))) {
+      return {
+        ok: false,
+        jobId,
+        details: 'Working tree is not clean. Commit/stash changes before resuming this job (it runs in the repo root).',
+      };
+    }
+  } else if (process.env.NIBBLER_VERBOSE === '1') {
+    const clean = await isClean(repo, { ignoreNibblerEngineArtifacts: true }).catch(() => true);
+    if (!clean) r.warn('Working tree has local changes; resuming job in its worktree and preserving them.');
+  }
   if (jobBranch && worktreePath) {
     const wtSpinner = r.spinner(`Preparing worktree for ${theme.bold(jobBranch)}...`);
     try {
@@ -152,15 +166,18 @@ export async function runExistingJob(args: RunExistingJobArgs): Promise<{ ok: bo
   const gates = new GateController(ledger, evidence);
   const runner = args.runner ?? new CursorRunnerAdapter();
   const sessionsWorkspace = worktreePath ?? repoRoot;
-  const sessions = new SessionController(runner, sessionsWorkspace, { inactivityTimeoutMs: 120_000 });
+  const sessions = new SessionController(runner, sessionsWorkspace, { inactivityTimeoutMs: resolveSessionInactivityTimeoutMs() });
 
   let activeRoleSpinner: SpinnerHandle | null = null;
   let activeRoleId: string | null = null;
-  const stopActiveRoleSpinner = (roleId: string, ok: boolean) => {
+  const stopActiveRoleSpinner = (
+    roleId: string,
+    args: { ok: boolean; successText?: string; failText?: string }
+  ) => {
     if (!activeRoleSpinner || activeRoleId !== roleId) return;
     const prefix = roleLabel(roleId);
-    if (ok) activeRoleSpinner.succeed(`${prefix}Session complete`);
-    else activeRoleSpinner.fail(`${prefix}Session needs revision`);
+    if (args.ok) activeRoleSpinner.succeed(`${prefix}${args.successText ?? 'Session complete'}`);
+    else activeRoleSpinner.fail(`${prefix}${args.failText ?? 'Session needs revision'}`);
     activeRoleSpinner = null;
     activeRoleId = null;
   };
@@ -171,6 +188,17 @@ export async function runExistingJob(args: RunExistingJobArgs): Promise<{ ok: bo
         const staged = join(sessionsWorkspace, '.nibbler-staging', 'plan', jobId);
         await copyDirIfExists(staged, jobPaths.planDir);
       }
+    },
+    onRolePlanStart: ({ roleId, attempt, maxAttempts }) => {
+      activeRoleSpinner?.stop();
+      activeRoleId = roleId;
+      activeRoleSpinner = r.spinner(`${roleLabel(roleId)}Preparing implementation plan (attempt ${attempt}/${maxAttempts})...`);
+    },
+    onRolePlanComplete: ({ roleId }) => {
+      stopActiveRoleSpinner(roleId, { ok: true, successText: 'Implementation plan ready' });
+    },
+    onRolePlanFailed: ({ roleId }) => {
+      stopActiveRoleSpinner(roleId, { ok: false, failText: 'Implementation plan failed; retrying...' });
     },
     onRoleStart: ({ roleId, attempt, maxAttempts }) => {
       activeRoleSpinner?.stop();
@@ -183,7 +211,7 @@ export async function runExistingJob(args: RunExistingJobArgs): Promise<{ ok: bo
       r.roleComplete(roleId, `${fileCount} file${fileCount !== 1 ? 's' : ''} changed (${lines} lines)`, durationMs);
     },
     onVerification: ({ roleId, scopePassed, completionPassed, scopeViolations, diff }) => {
-      stopActiveRoleSpinner(roleId, scopePassed && completionPassed);
+      stopActiveRoleSpinner(roleId, { ok: scopePassed && completionPassed });
       r.verificationStart(roleId);
       r.verificationResult(roleId, [
         { name: 'Scope check', passed: scopePassed, detail: scopePassed ? `${diff.summary.filesChanged} files, 0 violations` : `${scopeViolations?.length ?? 0} violation(s)` },
@@ -194,7 +222,7 @@ export async function runExistingJob(args: RunExistingJobArgs): Promise<{ ok: bo
       r.handoff(fromRole, toRole);
     },
     onEscalation: ({ roleId, reason }) => {
-      stopActiveRoleSpinner(roleId, false);
+      stopActiveRoleSpinner(roleId, { ok: false });
       r.roleEscalation(roleId, reason);
     },
   });
@@ -202,7 +230,10 @@ export async function runExistingJob(args: RunExistingJobArgs): Promise<{ ok: bo
   const job: JobState = {
     repoRoot,
     jobId,
-    mode: status.mode ?? ('resume' as const),
+    // IMPORTANT: when continuing an existing job we must enable resume semantics
+    // (rehydrate attempts, scope overrides, feedback) regardless of the job's original mode.
+    // Otherwise we risk repeating attempts and "retry storms" after pauses/crashes.
+    mode: 'resume' as const,
     description: status.description ?? undefined,
     worktreePath: worktreePath ?? undefined,
     sourceBranch: sourceBranch ?? undefined,
@@ -216,14 +247,28 @@ export async function runExistingJob(args: RunExistingJobArgs): Promise<{ ok: bo
     statusPath: jobPaths.statusPath,
     rolesCompleted: status.progress.roles_completed ?? [],
     rolesPlanned: [...(status.progress.roles_completed ?? []), ...(status.progress.roles_remaining ?? [])],
-    state: 'executing' as const,
+    // Preserve engine checkpoint state (paused-at-gate is a first-class resume case).
+    state: (status.state ?? 'executing') as any,
+    pendingGateId: (status.pending_gate_id ?? null) as any,
   };
+
+  // Rehydrate delegation plan so execution remains plan-driven after resume.
+  // The plan artifacts on disk are the source of truth; JobState stores the parsed form for orchestration.
+  try {
+    const delegationAbs = join(repoRoot, '.nibbler', 'jobs', jobId, 'plan', 'delegation.yaml');
+    job.delegationPlan = await readDelegationPlanYaml(delegationAbs);
+  } catch {
+    // Best-effort: older jobs or incomplete planning may not have a delegation plan.
+  }
 
   const cancellation = installCliCancellation({
     onCancel: async ({ signal }) => {
       r.warn('Cancelling job...');
       await jm.cancel(job, { signal, reason: 'signal' });
     },
+    onForceExit: async () => {
+      await jm.stopActiveSession();
+    }
   });
   const jobStartTime = Date.now();
   try {
@@ -244,6 +289,15 @@ export async function runExistingJob(args: RunExistingJobArgs): Promise<{ ok: bo
             return { ok: false, jobId, details: `Auto-merge skipped (${merged.reason}). Merge ${jobBranch} manually.` };
           }
           mergeSpinner.succeed(`Merged into ${theme.bold(sourceBranch)}`);
+          if (merged.reason === 'autostash_pop_conflicts') {
+            r.warn('Your local changes were stashed for the merge, but could not be fully restored cleanly.');
+            r.warn('Resolve the merge conflicts in your working tree (the stash entry should still exist).');
+            // The merge itself succeeded — don't fail the build for a stash-pop conflict.
+          }
+          if (merged.reason === 'autostash_pop_failed') {
+            r.warn('Merged successfully, but restoring your local changes failed.');
+            r.warn('Your stash entry should still exist; you can re-apply it manually.');
+          }
         } catch {
           mergeSpinner.fail('Merge failed');
           r.warn(`Job completed on ${theme.bold(jobBranch)} but could not be merged automatically.`);

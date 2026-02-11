@@ -45,12 +45,14 @@ export async function initJob(repoRoot: string, jobId: string): Promise<JobPaths
   const evidenceChecksDir = join(evidenceDir, 'checks');
   const evidenceCommandsDir = join(evidenceDir, 'commands');
   const evidenceGatesDir = join(evidenceDir, 'gates');
+  const evidenceSessionsDir = join(evidenceDir, 'sessions');
 
   await mkdir(planDir, { recursive: true });
   await mkdir(evidenceDiffsDir, { recursive: true });
   await mkdir(evidenceChecksDir, { recursive: true });
   await mkdir(evidenceCommandsDir, { recursive: true });
   await mkdir(evidenceGatesDir, { recursive: true });
+  await mkdir(evidenceSessionsDir, { recursive: true });
 
   const ledgerPath = join(jobDir, 'ledger.jsonl');
   const statusPath = join(jobDir, 'status.json');
@@ -85,6 +87,12 @@ export function getJobDir(repoRoot: string, jobId: string): string {
 
 export async function writeProtocolRule(repoRoot: string, content: string): Promise<void> {
   const target = join(repoRoot, '.cursor', 'rules', '00-nibbler-protocol.mdc');
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, content, 'utf8');
+}
+
+export async function writeWorkflowRules(repoRoot: string, content: string): Promise<void> {
+  const target = join(repoRoot, '.cursor', 'rules', '10-nibbler-workflow.mdc');
   await mkdir(dirname(target), { recursive: true });
   await writeFile(target, content, 'utf8');
 }

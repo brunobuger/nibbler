@@ -57,7 +57,9 @@ export function renderDiscoveryPrompt(ctx: DiscoveryPromptContext): string {
 
   lines.push('## Inputs available');
   lines.push(`- repoRoot: ${ctx.repoRoot}`);
-  lines.push(`- providedFiles: ${ctx.providedFiles.length ? ctx.providedFiles.join(', ') : '(none)'}`);
+  lines.push(
+    `- providedFiles: ${ctx.providedFiles.length ? ctx.providedFiles.map((p) => toContextRef(p, ctx.repoRoot)).join(', ') : '(none)'}`
+  );
   lines.push(`- hasPRD: ${ctx.project.hasPrdMd ? 'yes' : 'no'}`);
   lines.push(`- hasExistingVision: ${ctx.project.hasVisionMd ? 'yes' : 'no'}`);
   lines.push(`- hasExistingArchitecture: ${ctx.project.hasArchitectureMd ? 'yes' : 'no'}`);
@@ -109,5 +111,19 @@ export function renderDiscoveryPrompt(ctx: DiscoveryPromptContext): string {
   lines.push('');
 
   return lines.join('\n');
+}
+
+function toContextRef(path: string, repoRoot: string): string {
+  const p = String(path ?? '').trim();
+  if (!p) return '(unknown)';
+  // Keep cross-repo absolute paths as plain text hints (Cursor cannot always resolve them).
+  if (p.startsWith('/') && !p.startsWith(`${repoRoot.replace(/\/+$/, '')}/`)) {
+    return p;
+  }
+  const rel = p.startsWith(`${repoRoot.replace(/\/+$/, '')}/`)
+    ? p.slice(repoRoot.replace(/\/+$/, '').length + 1)
+    : p;
+  if (rel.startsWith('@')) return rel;
+  return `@${rel}`;
 }
 

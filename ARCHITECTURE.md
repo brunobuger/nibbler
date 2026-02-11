@@ -85,7 +85,7 @@ Each role commits directly to the job branch in the job worktree. On successful 
 
 ### 2.2. Component Responsibilities
 
-**Nibbler CLI** — Entry point. Parses commands (`init`, `build`, `status`, `list`, `history`, `resume`), initializes the Job Manager, handles top-level error reporting and signal handling.
+**Nibbler CLI** — Entry point. Parses commands (`init`, `build`, `fix`, `status`, `list`, `history`, `resume`), initializes the Job Manager, handles top-level error reporting and signal handling.
 
 **Job Manager** — The orchestration core. Maintains the job state machine, drives phase transitions, coordinates all other components. Owns the main loop: prepare session → launch session → collect evidence → verify → transition or loop.
 
@@ -136,6 +136,13 @@ The contract must declare:
 - A global job lifetime budget
 - An escalation chain (what happens when a worker can't resolve an issue)
 - Shared scope declarations (paths where multiple roles' scopes overlap)
+
+**Effective write set (runtime):**
+At runtime, Nibbler treats a role’s writable surface as:
+- `role.scope` (owned paths)
+- `sharedScopes` (explicitly declared overlaps)
+- `role.authority.allowedPaths` (extra write access; commonly used for “open Architect scope”)
+…minus engine-protected paths (see Section 10.2).
 
 ### 3.2. Contract Validation Algorithm
 
@@ -521,6 +528,17 @@ function enforce_gate(gate_def, job):
     // Prepare gate inputs
     inputs = collect_gate_inputs(gate_def, job)
 
+    // Compute a deterministic fingerprint for this gate state.
+    // For planning-origin gates, include a digest of `.nibbler/jobs/<id>/plan/**`
+    // so plan edits force re-approval.
+    fp = compute_gate_fingerprint(gate_def, job, inputs)
+
+    // Dedupe: if the most recent gate_resolved for this gate was APPROVE and fp matches,
+    // auto-apply approval without prompting again (recovery/resume).
+    last = ledger.last_gate_resolved(gate_def.id)
+    if last.decision == "approve" and last.fingerprint == fp:
+        return gate_def.outcomes["approve"]
+
     // Present to audience
     resolution = gate_controller.present_gate(
         gate: gate_def,
@@ -530,11 +548,12 @@ function enforce_gate(gate_def, job):
 
     // Record in ledger
     ledger.append({
-        type: "gate_resolution",
+        type: "gate_resolved",
         gate: gate_def.id,
         audience: gate_def.audience,
         resolution: resolution.decision,  // approve | reject
         notes: resolution.notes,
+        fingerprint: fp,
         timestamp: now()
     })
 
@@ -548,61 +567,64 @@ function enforce_gate(gate_def, job):
 
 ### 7.1. Job Lifecycle
 
-A job is the unit of work in Nibbler. It represents a single `nibbler build` invocation and tracks all state from discovery through ship.
+A job is the unit of work in Nibbler. It represents a single `nibbler build` invocation and tracks all state required to execute the **contract-defined phase graph** (typically planning → execution → ship) inside a dedicated worktree.
+
+Discovery artifacts (`vision.md`, `architecture.md`) are produced during `nibbler init` (unless they already exist) and are **prerequisites** for `nibbler build` in the current implementation.
 
 **Job states:**
-- `created` — Job initialized, branch created
-- `discovering` — Discovery phase active (PO interview)
-- `planning` — Architect planning session active
-- `plan_gated` — Waiting for PO PLAN gate approval
-- `scaffolding` — Architect creating project boilerplate
-- `executing` — Worker sessions running sequentially
-- `review` — Architect reviewing work
-- `ship_gated` — Waiting for PO SHIP gate approval
-- `completed` — All gates approved, branch ready
+- `created` — Job initialized (id allocated, branch/worktree prepared, ledger opened)
+- `executing` — Orchestration is running (role sessions + deterministic verification)
+- `paused` — Waiting on a gate resolution (`pendingGateId` set)
+- `completed` — Terminal phase reached and any terminal gate resolved
 - `failed` — Job terminated due to unrecoverable error
 - `cancelled` — Job cancelled by PO
 - `budget_exceeded` — Job terminated by global lifetime budget
 
-The specific state names above are the engine's internal states. The contract's phase definitions map onto these states but may use different terminology.
+Phase semantics (planning/scaffold/execution/ship, etc.) are tracked via `currentPhaseId` (contract phase id) and `currentRoleId` (active actor). Gate waiting is represented by `state="paused"` plus `pendingGateId`.
 
 ### 7.2. The Main Loop
 
 ```
 function run_job(job):
     try:
-        // Phase 1 — Discovery
-        run_discovery(job)
+        // Contract-driven execution (phases + gates + criteria)
+        start_phase = find_start_phase(contract)
+        job.set_state("executing")
+        phase_id = start_phase
 
-        // Phase 2 — Planning
-        run_planning(job)
+        while true:
+            phase = contract.get_phase(phase_id)
 
-        // Phase 3 — PO PLAN Gate
-        outcome = enforce_gate("plan", job)
-        if outcome == "reject":
-            follow_recovery_path("plan", "reject", job)
-            return
+            // Run each actor in the phase (sequentially).
+            // (If delegation is present, execution may be ordered by the delegation plan.)
+            for role_id in phase.actors:
+                outcome = run_role_session(role_id, job)
+                if outcome != "ok":
+                    finalize(job, outcome)
+                    return
 
-        // Phase 4 — Scaffold (if needed)
-        if repo_needs_scaffold(job):
-            run_scaffold(job)
+            // Terminal phase: optional terminal gate at `${phase_id}->__END__`
+            if phase.is_terminal or phase.successors.is_empty:
+                maybe_enforce_gate(f"{phase_id}->__END__", job)
+                job.set_state("completed")
+                return
 
-        // Phase 5 — Execution (sequential, per delegation order)
-        delegation = load_delegation(job)
-        for role_task_group in delegation.ordered_groups():
-            run_role_session(role_task_group, job)
+            // Default successor selection: prefer `on=done`, else first successor
+            next_id = select_successor(phase)
+            transition = f"{phase_id}->{next_id}"
 
-            // Architect review after each role (if contract requires)
-            if contract.requires_review_after(role_task_group.role):
-                run_architect_review(role_task_group, job)
+            // Gate enforcement (contract-defined)
+            gate_def = contract.gate_for_trigger(transition)
+            if gate_def:
+                job.set_state("paused")
+                job.pending_gate_id = gate_def.id
+                mapped = enforce_gate(gate_def, job)   // returns next phase id (or __END__)
+                job.set_state("executing")
+                job.pending_gate_id = null
+                phase_id = mapped
+                continue
 
-        // Phase 6 — PO SHIP Gate
-        outcome = enforce_gate("ship", job)
-        if outcome == "reject":
-            follow_recovery_path("ship", "reject", job)
-            return
-
-        job.set_state("completed")
+            phase_id = next_id
 
     except BudgetExceededException:
         job.set_state("budget_exceeded")
@@ -802,12 +824,12 @@ function ingest_materials(provided_files, existing_repo):
     return context
 ```
 
-### 8.4. Discovery Session Flow
+### 8.4. Discovery Session Flow (init-time)
 
 ```
-function run_discovery(job):
+function run_discovery(repo_root, provided_files, force=false):
     // Ingest
-    context = ingest_materials(job.provided_files, job.workspace)
+    context = ingest_materials(provided_files, repo_root)
 
     // Classify project type (may require a quick agent query)
     project_type = classify_or_ask_project_type(context)
@@ -820,13 +842,13 @@ function run_discovery(job):
 
     // Compile discovery context
     // The Architect gets: meta-rules, the schema, ingested materials
-    compile_discovery_context(schema, context, job)
+    compile_discovery_context(schema, context)
 
     // Run Architect session in discovery mode
     // The session interactively asks the PO questions
     // The engine mediates: agent proposes questions → engine presents to PO
     //   → PO answers → engine feeds answer back to agent
-    run_interactive_discovery_session(job, schema)
+    run_interactive_discovery_session(repo_root, schema)
 
     // Synthesize outputs
     // The Architect session produces vision.md and architecture.md
@@ -834,7 +856,10 @@ function run_discovery(job):
 
     // Verify discovery outputs exist
     assert exists("vision.md"), "Discovery must produce vision.md"
-    git_commit("[nibbler:{job.id}] discovery complete")
+    assert exists("architecture.md"), "Discovery must produce architecture.md"
+
+    // Note: in the current implementation, discovery runs during `nibbler init`.
+    // The resulting docs are committed alongside the contract when init completes.
 ```
 
 ### 8.5. architecture.md Generation and Reconciliation
@@ -847,12 +872,11 @@ The discovery phase handles three scenarios for `architecture.md`:
 3. PO accepts or overrides each major decision
 4. Result committed as `architecture.md`
 
-**Existing file, new project (via `nibbler build`):**
-1. Architect reads existing `architecture.md` and new `vision.md`
+**Existing docs, remediation (via `nibbler init` rediscovery):**
+1. Architect reads existing `architecture.md` and `vision.md`
 2. Flags conflicts, gaps, and over-specification
 3. Proposes updates
-4. PO approves changes
-5. Updated `architecture.md` committed
+4. Updated `architecture.md` written (and committed as part of init)
 
 **Existing repo with code:**
 1. Architect reads `architecture.md`, `vision.md`, *and* scans actual codebase
@@ -871,7 +895,7 @@ source_branch (user's current branch)
   └── merge-back (on success, when safe)
         ▲
         │
-        └── nibbler/job-<id> or nibbler/fix-<id>   ← work happens here (in a worktree)
+        └── nibbler/job-<id>                       ← work happens here (in a worktree)
               ├── commit: <role1> complete
               ├── commit: <role2> complete
               └── (linear history, one commit per role completion)
@@ -884,6 +908,9 @@ Jobs run in a dedicated worktree located next to the repo (stable + discoverable
 `<repoParent>/.nibbler-wt-<repoBasename>/<jobId>/`
 
 Engine state and evidence stay under the main repo root in `.nibbler/jobs/<id>/...` (gitignored), while code changes happen in the worktree.
+
+**Worktree health (robustness):**
+Git worktrees rely on metadata under `.git/worktrees/**`. If that metadata is missing/corrupted (e.g. due to external cleanup), git commands inside the worktree can fail with “not a git repository”. The Job Manager performs a best-effort **worktree health check and repair** before critical git operations (diff/finalize) so jobs fail less often and retries don’t cascade.
 
 ### 9.2. Pre-Session / Post-Session State
 
@@ -996,6 +1023,7 @@ The following paths are excluded from all role scopes as a meta-rule (5.3) enfor
 
 - `.nibbler/**` — All engine state, ledger, evidence, contract
 - `.cursor/rules/00-nibbler-protocol.mdc` — Base protocol rules
+- `.git/**` — Git internals (including worktree metadata)
 
 The engine verifies this exclusion both at contract validation time (rejecting any scope that includes these paths) and at runtime (checking post-session diffs for protected path modifications).
 
@@ -1097,6 +1125,8 @@ function verify_ledger_integrity(ledger_path):
 │   ├── <role>-<seq>-<command>.stdout   # Command stdout
 │   ├── <role>-<seq>-<command>.stderr   # Command stderr
 │   └── <role>-<seq>-<command>.meta.json # Exit code, duration, command text
+├── sessions/
+│   └── <role>-<phase>-<attempt>.log    # Raw Cursor session transcript (stream-json text)
 └── gates/
     ├── <gate>-inputs.json              # What was presented to the audience
     └── <gate>-resolution.json          # Decision, notes, timestamp
@@ -1338,6 +1368,12 @@ function architect_resolution(failed_role, job):
         job.block_task(resolution.task_id, resolution.reason)
 ```
 
+**Autonomous job-level recovery (CLI):**
+- When a job fails and the CLI attempts autonomous recovery, it **restarts orchestration from the failing phase**
+  (the persisted `currentPhaseId`) rather than re-running earlier phases like planning. This minimizes unnecessary PO prompts.
+- If orchestration does re-encounter an already-approved PO gate (e.g. PLAN) during recovery/resume, the engine
+  uses the ledger-recorded gate fingerprint to **auto-apply approval** when the underlying artifacts are unchanged.
+
 ### 15.3. Evidence Preservation on Failure
 
 All error paths converge on evidence capture:
@@ -1371,7 +1407,7 @@ nibbler <command> [options] [arguments]
 
 Commands:
   init                    Generate or review the project governance contract
-  build <requirement>     Run a full job: discovery → plan → execute → ship
+  build [requirement]     Run a full job: plan → execute → ship (contract-defined)
   status [job-id]         Show job status
   list                    List active jobs
   history                 List completed jobs
@@ -1383,21 +1419,21 @@ Commands:
 **`nibbler init [options]`**
 ```
 Options:
+  --file <path>     Input document for discovery (repeatable)
   --review          Re-evaluate and update existing contract
+  --skip-discovery  Skip discovery (requires existing vision.md + architecture.md)
   --dry-run         Preview proposed contract without committing
-  --type <type>     Hint project type (web-app, api, cli, mobile, library, pipeline)
 ```
 
-**`nibbler build <requirement> [options]`**
+**`nibbler build [requirement] [options]`**
 ```
 Arguments:
-  requirement       Natural language description of what to build (quoted string)
+  requirement       Natural language description of what to build (optional, quoted string)
 
 Options:
-  --file <path>     Input document (PRD, spec, etc). Repeatable.
-  --dry-run         Run discovery and planning only, show execution plan
-  --skip-discovery  Skip discovery (use existing vision.md)
-  --skip-scaffold   Skip scaffolding even if repo appears empty
+  --file <path>     Accepted (repeatable). Currently reserved; discovery inputs are handled by `nibbler init --file`.
+  --dry-run         Print the contract-defined execution plan summary (no agent sessions run)
+  --skip-scaffold   Accepted. Currently a hint; scaffolding is controlled by the contract phases.
 ```
 
 **`nibbler status [job-id]`**

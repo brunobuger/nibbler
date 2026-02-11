@@ -266,18 +266,113 @@ export class InteractiveRenderer implements Renderer {
     // Build box content
     const boxLines: string[] = [];
     boxLines.push(`${theme.gate.label('Job:')}    ${model.title}`);
-    if (model.subtitle) {
-      boxLines.push(`${theme.gate.label('Scope:')}  ${model.subtitle}`);
+    if (model.description && model.description !== model.title) {
+      boxLines.push(`${theme.gate.label('Req:')}    ${model.description}`);
+    }
+    if (model.subtitle) boxLines.push(`${theme.gate.label('Audience:')} ${model.subtitle.replace(/^Gate audience:\\s*/i, '')}`);
+
+    // Reduce redundancy: prefer a single transition/outcomes line.
+    if (model.transition?.includes('->__END__')) {
+      boxLines.push(`${theme.gate.label('Trigger:')} ${model.transition}`);
+    } else if (model.currentPhase && model.approveNext) {
+      boxLines.push(`${theme.gate.label('Transition:')} ${model.currentPhase} ${theme.arrow} ${model.approveNext}`);
+    } else if (model.transition) {
+      boxLines.push(`${theme.gate.label('Trigger:')} ${model.transition}`);
+    }
+    if (model.approveNext || model.rejectNext) {
+      const approve = model.approveNext ? `approve ${theme.arrow} ${model.approveNext}` : '';
+      const reject = model.rejectNext ? `reject ${theme.arrow} ${model.rejectNext}` : '';
+      const combined = `${approve}${approve && reject ? theme.dim('  |  ') : ''}${reject}`.trim();
+      if (combined) boxLines.push(`${theme.gate.label('Outcomes:')} ${combined}`);
+    }
+    if (model.approvalScope) {
+      boxLines.push(`${theme.gate.label('Approval Scope:')} ${model.approvalScope}`);
     }
     boxLines.push('');
+
+    if (model.team && model.team.length > 0) {
+      boxLines.push(theme.bold('Team:'));
+      const maxRoleLen = Math.max(...model.team.map((t) => t.roleId.length), 4);
+      for (const t of model.team) {
+        const roleColor = theme.role(t.roleId);
+        const scope = Array.isArray(t.scope) ? t.scope : [];
+        const scopeStr =
+          scope.length <= 3 ? scope.join(', ') : `${scope.slice(0, 2).join(', ')} +${scope.length - 2} more`;
+        boxLines.push(`  ${roleColor(theme.bold(t.roleId.padEnd(maxRoleLen + 2)))}${theme.dim(scopeStr)}`);
+      }
+      boxLines.push('');
+    }
+
+    if (model.completionCriteria && model.completionCriteria.length > 0) {
+      const criteriaTitle = model.approvalScope === 'build_requirements' ? 'Verification Checks:' : 'Acceptance Criteria:';
+      boxLines.push(theme.bold(criteriaTitle));
+      for (const line of model.completionCriteria) {
+        boxLines.push(`  ${theme.check} ${line}`);
+      }
+      boxLines.push('');
+    }
+
+    if (model.approvalExpectations && model.approvalExpectations.length > 0) {
+      boxLines.push(theme.bold('Build Expectations:'));
+      for (const line of model.approvalExpectations) boxLines.push(`  ${theme.bullet} ${line}`);
+      boxLines.push('');
+    }
+
+    if (model.businessOutcomes && model.businessOutcomes.length > 0) {
+      boxLines.push(theme.bold('Business Outcomes:'));
+      for (const line of model.businessOutcomes) boxLines.push(`  ${theme.bullet} ${line}`);
+      boxLines.push('');
+    }
+
+    if (model.functionalScope && model.functionalScope.length > 0) {
+      boxLines.push(theme.bold('Functional Scope:'));
+      for (const line of model.functionalScope) boxLines.push(`  ${theme.bullet} ${line}`);
+      boxLines.push('');
+    }
+
+    if (model.outOfScope && model.outOfScope.length > 0) {
+      boxLines.push(theme.bold('Out of Scope:'));
+      for (const line of model.outOfScope) boxLines.push(`  ${theme.bullet} ${line}`);
+      boxLines.push('');
+    }
+
+    if (model.outputExpectations && model.outputExpectations.length > 0) {
+      boxLines.push(theme.bold('Output Expectations:'));
+      for (const r of model.outputExpectations) {
+        const color = theme.role(r.roleId);
+        const shown = r.expectations.slice(0, 3);
+        boxLines.push(`  ${color(theme.bold(r.roleId))}`);
+        for (const e of shown) boxLines.push(`    ${theme.bullet} ${e}`);
+        if (r.expectations.length > shown.length) {
+          boxLines.push(`    ${theme.dim(`+${r.expectations.length - shown.length} more`)}`);
+        }
+      }
+      boxLines.push('');
+    }
 
     if (model.artifacts.length > 0) {
       boxLines.push(theme.bold('Artifacts:'));
       for (const a of model.artifacts) {
         const status = a.exists === false ? theme.error('missing') : theme.success('ok');
         const displayPath = a.path ?? a.name;
-        boxLines.push(`  ${displayPath}  ${status}`);
+        const previewLines = a.preview ? countLines(a.preview) : 0;
+        const previewHint =
+          a.preview && previewLines > 0
+            ? theme.dim(` (preview: ${previewLines} line${previewLines === 1 ? '' : 's'})`)
+            : '';
+        const globHint =
+          a.matchesCount != null
+            ? theme.dim(` (glob: ${a.matchesCount} match${a.matchesCount === 1 ? '' : 'es'}${a.exampleMatch ? `, ex: ${a.exampleMatch}` : ''})`)
+            : '';
+        boxLines.push(`  ${displayPath}  ${status}${previewHint}${globHint}`);
       }
+      boxLines.push('');
+    }
+
+    if (model.rolesCompleted && model.rolesRemaining) {
+      const done = model.rolesCompleted.length;
+      const total = done + model.rolesRemaining.length;
+      boxLines.push(`${theme.gate.label('Progress:')} ${done}/${total} roles completed`);
     }
 
     const box = drawBox(`PO Gate: ${gateDef.id.toUpperCase()}`, boxLines, RULE_WIDTH);
@@ -291,6 +386,7 @@ export class InteractiveRenderer implements Renderer {
         choices: [
           { name: `${chalk.green('Approve')}`, value: 'approve' as const },
           { name: `${chalk.red('Reject')}`, value: 'reject' as const },
+          { name: `${chalk.dim('View artifact')}`, value: 'artifact' as const },
           { name: `${chalk.dim('View inputs')}`, value: 'view' as const },
         ],
       });
@@ -303,6 +399,46 @@ export class InteractiveRenderer implements Renderer {
       if (action === 'reject') {
         const notes = await promptInput({ message: 'Rejection reason', default: '' });
         return { decision: 'reject', notes: notes.trim() || undefined };
+      }
+
+      if (action === 'artifact') {
+        const candidates = [
+          { name: `${chalk.dim('Back')}`, value: '__back__' },
+          ...model.artifacts
+            .filter((a) => a.exists !== false)
+            .map((a) => {
+              const label = a.path ?? a.name;
+              const suffix = a.preview ? theme.dim(` (${countLines(a.preview)} lines)`) : theme.dim(' (no preview)');
+              return { name: `${label}${suffix}`, value: a.name };
+            }),
+        ];
+
+        if (!candidates.length) {
+          this.writeln();
+          this.writeln(`${INDENT}${theme.dim('No artifacts available to preview.')}`);
+          this.writeln();
+          continue;
+        }
+
+        const chosen = await promptSelect<string>({
+          message: 'Select artifact',
+          choices: candidates,
+        });
+        if (chosen === '__back__') continue;
+
+        const artifact = model.artifacts.find((a) => a.name === chosen);
+        this.writeln();
+        this.writeln(INDENT + theme.dim('── Artifact Preview ──'));
+        this.writeln(INDENT + theme.bold(artifact?.path ?? artifact?.name ?? chosen));
+        if (artifact?.preview) {
+          const preview = truncateLines(artifact.preview, 160);
+          this.writeln(preview.endsWith('\n') ? preview.trimEnd() : preview);
+        } else {
+          this.writeln(INDENT + theme.dim('(no preview available)'));
+        }
+        this.writeln(INDENT + theme.dim('── end ──'));
+        this.writeln();
+        continue;
       }
 
       // View inputs
@@ -369,6 +505,18 @@ export class InteractiveRenderer implements Renderer {
   }
 }
 
+function countLines(text: string): number {
+  if (!text) return 0;
+  // Normalize newline handling; keep it cheap.
+  return text.replace(/\n$/g, '').split('\n').length;
+}
+
+function truncateLines(text: string, maxLines: number): string {
+  const lines = text.split('\n');
+  if (lines.length <= maxLines) return text;
+  return lines.slice(0, maxLines).join('\n') + '\n... (truncated)\n';
+}
+
 // ── Quiet Renderer (JSON Lines) ─────────────────────────────────────────────
 
 export class QuietRenderer implements Renderer {
@@ -391,9 +539,25 @@ export class QuietRenderer implements Renderer {
 
   contractSummary(contract: Parameters<typeof contractSummary>[0]): void {
     this.emit('contract_summary', {
-      roles: contract.roles.map((r) => r.id),
-      phases: contract.phases.map((p) => p.id),
-      gates: contract.gates.map((g) => g.id),
+      roles: contract.roles.map((r) => ({
+        id: r.id,
+        scope: r.scope,
+        outputExpectations: r.outputExpectations ?? [],
+      })),
+      phases: contract.phases.map((p) => ({
+        id: p.id,
+        actors: p.actors,
+        completionCriteria: p.completionCriteria,
+        successors: p.successors ?? [],
+        isTerminal: p.isTerminal ?? false,
+      })),
+      gates: contract.gates.map((g) => ({
+        id: g.id,
+        audience: String(g.audience),
+        trigger: g.trigger,
+        requiredInputs: g.requiredInputs ?? [],
+        outcomes: g.outcomes ?? {},
+      })),
     });
   }
 
@@ -466,7 +630,41 @@ export class QuietRenderer implements Renderer {
     const testResult = resolveTestGateDecision(gateDef);
     if (testResult) return testResult;
 
-    this.emit('gate_waiting', { gate: gateDef.id });
+    // Emit useful gate context for non-interactive consumers.
+    // Avoid emitting large file previews in quiet mode.
+    this.emit('gate_waiting', {
+      gate: gateDef.id,
+      trigger: gateDef.trigger,
+      audience: String(gateDef.audience),
+      requiredInputs: gateDef.requiredInputs ?? [],
+      outcomes: gateDef.outcomes ?? {},
+      model: {
+        title: (_model as any)?.title,
+        description: (_model as any)?.description,
+        transition: (_model as any)?.transition,
+        currentPhase: (_model as any)?.currentPhase,
+        approveNext: (_model as any)?.approveNext,
+        rejectNext: (_model as any)?.rejectNext,
+        approvalScope: (_model as any)?.approvalScope,
+        approvalExpectations: (_model as any)?.approvalExpectations,
+        businessOutcomes: (_model as any)?.businessOutcomes,
+        functionalScope: (_model as any)?.functionalScope,
+        outOfScope: (_model as any)?.outOfScope,
+        completionCriteria: (_model as any)?.completionCriteria,
+        outputExpectations: (_model as any)?.outputExpectations,
+        rolesCompleted: (_model as any)?.rolesCompleted,
+        rolesRemaining: (_model as any)?.rolesRemaining,
+        artifacts: Array.isArray((_model as any)?.artifacts)
+          ? (_model as any).artifacts.map((a: any) => ({
+              name: a?.name,
+              path: a?.path,
+              exists: a?.exists,
+              matchesCount: a?.matchesCount,
+              exampleMatch: a?.exampleMatch,
+            }))
+          : [],
+      },
+    });
     // In non-interactive quiet mode, default to approve.
     return { decision: 'approve', notes: 'auto-approved (quiet mode)' };
   }

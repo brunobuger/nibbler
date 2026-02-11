@@ -19,11 +19,22 @@ export function validateDelegation(plan: DelegationPlan, contract: Contract): De
   }
 
   const roleIds = new Set(contract.roles.map((r) => r.id));
+  const executionPhase = contract.phases.find((p) => p.id === 'execution');
+  const executionActors = new Set<string>(executionPhase?.actors ?? []);
   const byTaskId = new Map<string, { roleId: string; dependsOn: string[] }>();
 
   for (const t of plan.tasks) {
     if (!roleIds.has(t.roleId)) {
       errors.push({ rule: 'delegation', message: `Unknown roleId '${t.roleId}' in task '${t.taskId}'` });
+    }
+    if (executionActors.size > 0 && !executionActors.has(t.roleId)) {
+      errors.push({
+        rule: 'delegation',
+        message:
+          `Task '${t.taskId}' assigns roleId '${t.roleId}', but that role is not an actor in the 'execution' phase. ` +
+          `Delegation tasks must target execution-phase actors only.`,
+        details: { taskId: t.taskId, roleId: t.roleId, executionActors: Array.from(executionActors) }
+      });
     }
 
     if (!t.description || t.description.trim().length === 0) {
@@ -36,7 +47,10 @@ export function validateDelegation(plan: DelegationPlan, contract: Contract): De
     }
 
     const role = contract.roles.find((r) => r.id === t.roleId);
-    const inRole = role ? picomatch(role.scope, { dot: true }) : null;
+    // Delegation scopeHints must be achievable by the assigned role. In addition to the role's
+    // declared scope, roles may have extra write access via authority.allowedPaths.
+    const rolePatterns = role ? [...(role.scope ?? []), ...((role.authority?.allowedPaths as string[] | undefined) ?? [])] : [];
+    const inRole = rolePatterns.length ? picomatch(rolePatterns, { dot: true }) : null;
     const sharedMatchers = contract.sharedScopes
       .filter((s) => s.roles.includes(t.roleId))
       .map((s) => picomatch(s.patterns.length ? s.patterns : ['**/*'], { dot: true }));

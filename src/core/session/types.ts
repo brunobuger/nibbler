@@ -16,10 +16,13 @@ export interface SessionHandle {
   pid?: number;
   startedAtIso: string;
   lastActivityAtIso: string;
+  exitCode?: number | null;
+  signal?: string | null;
 }
 
 export type SessionOutcome =
   | { kind: 'event'; event: NibblerEvent }
+  | { kind: 'budget_exceeded' }
   | { kind: 'inactive_timeout' }
   | { kind: 'process_exit'; exitCode: number | null; signal: string | null };
 

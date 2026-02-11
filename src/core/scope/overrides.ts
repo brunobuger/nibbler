@@ -88,10 +88,8 @@ export function buildEffectiveContractForSession(
   roleId: string,
   opts: { phaseId: string; attempt: number }
 ): Contract {
-  const nextLike = isNextJsLikeContract(contract);
   const roles = contract.roles.map((r) => {
-    const effective = r.id === roleId ? buildEffectiveRoleDefinition(r, job, { phaseId: opts.phaseId, attempt: opts.attempt }) : r;
-    return applyEngineDefaultRoleScope(effective, { nextLike });
+    return r.id === roleId ? buildEffectiveRoleDefinition(r, job, { phaseId: opts.phaseId, attempt: opts.attempt }) : r;
   });
   const attemptByRole: Record<string, number> = {};
   for (const r of contract.roles) attemptByRole[r.id] = job.attemptsByRole?.[r.id] ?? (r.id === roleId ? opts.attempt : 1);
@@ -106,33 +104,33 @@ export function buildEffectiveContractForSession(
   };
 }
 
-function applyEngineDefaultRoleScope(role: RoleDefinition, opts: { nextLike: boolean }): RoleDefinition {
-  // Next.js scaffolding commonly generates `next-env.d.ts` at repo root.
-  if (opts.nextLike && role.id === 'frontend' && !role.scope.includes('next-env.d.ts')) {
-    return { ...role, scope: [...role.scope, 'next-env.d.ts'] };
-  }
-  return role;
-}
-
 function applyEngineDefaultSharedScopes(sharedScopes: SharedScopeDeclaration[], contract: Contract): SharedScopeDeclaration[] {
+  const roleIds = contract.roles.map((r) => r.id);
+  const out = [...sharedScopes];
+
   // `.gitignore` is a common repo-hygiene file needed during scaffolding. Treat it as globally shared.
   const hasGitignore = sharedScopes.some((s) => (s.patterns ?? []).includes('.gitignore'));
-  if (hasGitignore) return sharedScopes;
+  if (!hasGitignore) {
+    out.push({ roles: roleIds, patterns: ['.gitignore'] });
+  }
 
-  const roleIds = contract.roles.map((r) => r.id);
-  return [
-    ...sharedScopes,
-    {
-      roles: roleIds,
-      patterns: ['.gitignore']
-    }
-  ];
+  // `package.json` and `package-lock.json` are frequently modified by execution roles
+  // (e.g. `npm install` adds deps). Auto-share them to prevent scope violations.
+  const hasPackageJson = sharedScopes.some((s) =>
+    (s.patterns ?? []).some((p) => p === 'package.json' || p === 'package*.json')
+  );
+  if (!hasPackageJson) {
+    out.push({ roles: roleIds, patterns: ['package.json', 'package-lock.json'] });
+  }
+
+  // Next.js TypeScript projects require `next-env.d.ts`. It is often generated during scaffold/build.
+  // Auto-share it to avoid scope churn on first compile.
+  const hasNextEnv = sharedScopes.some((s) => (s.patterns ?? []).includes('next-env.d.ts'));
+  if (!hasNextEnv) {
+    out.push({ roles: roleIds, patterns: ['next-env.d.ts'] });
+  }
+
+  return out;
 }
 
-function isNextJsLikeContract(contract: Contract): boolean {
-  const pats: string[] = [];
-  for (const r of contract.roles) pats.push(...(r.scope ?? []));
-  for (const s of contract.sharedScopes ?? []) pats.push(...(s.patterns ?? []));
-  return pats.some((p) => p === 'next.config.*' || p.startsWith('next.config.'));
-}
 

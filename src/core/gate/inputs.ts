@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
 import type { GateDefinition } from '../contract/types.js';
 import { fileExists, readText } from '../../utils/fs.js';
@@ -10,7 +11,7 @@ export type GateInputs = Record<string, unknown>;
 export async function collectGateInputs(
   gateDef: GateDefinition,
   repoRoot: string,
-  opts: { maxChars?: number; tokens?: Record<string, string> } = {}
+  opts: { maxChars?: number; tokens?: Record<string, string>; extraRoots?: string[] } = {}
 ): Promise<GateInputs> {
   const out: GateInputs = {};
   const maxChars = opts.maxChars ?? 20_000;
@@ -18,7 +19,7 @@ export async function collectGateInputs(
   const jobId = tokens.id;
 
   const searchRoots = (() => {
-    const roots = [repoRoot];
+    const roots = [repoRoot, ...(opts.extraRoots ?? [])].filter(Boolean);
     if (jobId) {
       // Planning artifacts are written to staging and materialized into `.nibbler/jobs/<id>/plan/`.
       // Gate inputs should treat those as valid sources for path-based inputs, especially when inputs use globs.
@@ -55,11 +56,13 @@ export async function collectGateInputs(
       const first = found.matches[0]!;
       const abs = join(found.root, first);
       const content = await readText(abs).catch(() => '');
+      const sha256 = content ? createHash('sha256').update(content, 'utf8').digest('hex') : undefined;
       const preview = content.length > maxChars ? `${content.slice(0, maxChars)}\n... (truncated)\n` : content;
       out[spec.name] = {
         kind: 'path',
         path: rel,
         exists: true,
+        sha256,
         preview,
         resolved: { root: found.root, example: first, matchesCount: found.matches.length }
       };
@@ -74,6 +77,11 @@ export async function collectGateInputs(
         absFound = abs;
         break;
       }
+      const caseInsensitive = await resolvePathCaseInsensitive(root, rel);
+      if (caseInsensitive) {
+        absFound = caseInsensitive;
+        break;
+      }
     }
     if (!absFound) {
       out[spec.name] = { kind: 'path', path: rel, exists: false };
@@ -81,8 +89,9 @@ export async function collectGateInputs(
     }
 
     const content = await readText(absFound);
+    const sha256 = content ? createHash('sha256').update(content, 'utf8').digest('hex') : undefined;
     const preview = content.length > maxChars ? `${content.slice(0, maxChars)}\n... (truncated)\n` : content;
-    out[spec.name] = { kind: 'path', path: rel, exists: true, preview };
+    out[spec.name] = { kind: 'path', path: rel, exists: true, sha256, preview };
   }
 
   return out;
@@ -124,5 +133,35 @@ async function listFilesRec(root: string, ignoreDirs: string[]): Promise<string[
   }
   await walk('');
   return out.filter((p) => p.length > 0);
+}
+
+async function resolvePathCaseInsensitive(root: string, relPath: string): Promise<string | null> {
+  const normalized = relPath.replaceAll('\\', '/').replace(/^\.\/+/, '');
+  const parts = normalized.split('/').filter(Boolean);
+  if (parts.length === 0) return null;
+
+  let currentDir = root;
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i]!;
+    const isLast = i === parts.length - 1;
+    let entries: Awaited<ReturnType<typeof readdir>>;
+    try {
+      entries = await readdir(currentDir, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+
+    const matched =
+      entries.find((e) => e.name === part) ??
+      entries.find((e) => e.name.toLowerCase() === part.toLowerCase());
+    if (!matched) return null;
+
+    const nextPath = join(currentDir, matched.name);
+    if (isLast) return nextPath;
+    if (!matched.isDirectory()) return null;
+    currentDir = nextPath;
+  }
+
+  return null;
 }
 

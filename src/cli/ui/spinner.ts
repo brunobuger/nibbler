@@ -24,7 +24,12 @@ export interface SpinnerHandle {
  * In non-TTY environments, prints a static line instead.
  */
 export function startSpinner(text: string): SpinnerHandle {
-  const isTTY = process.stderr.isTTY;
+  const isTTY = Boolean(process.stderr.isTTY || process.stdout.isTTY);
+  const verbose = process.env.NIBBLER_VERBOSE === '1' && process.env.NIBBLER_QUIET !== '1';
+  // Prefer stderr for normal runs (keeps stdout clean for piping), but in verbose mode
+  // we print lots of debug lines to stderr, which can visually "erase" ora spinners.
+  const stream: NodeJS.WritableStream =
+    verbose && process.stdout.isTTY ? process.stdout : (process.stderr.isTTY ? process.stderr : process.stdout);
 
   // NOTE:
   // - `NO_COLOR` should disable colors, not spinners.
@@ -32,22 +37,22 @@ export function startSpinner(text: string): SpinnerHandle {
   //   in CI, so we explicitly force-enable when stderr is a TTY.
   if (!isTTY || process.env.NIBBLER_QUIET === '1') {
     // Non-interactive fallback: static lines.
-    process.stderr.write(`  ${text}\n`);
+    stream.write(`  ${text}\n`);
     return {
       update(t: string) {
-        process.stderr.write(`  ${t}\n`);
+        stream.write(`  ${t}\n`);
       },
       succeed(t?: string) {
-        if (t) process.stderr.write(`  ✔ ${t}\n`);
+        if (t) stream.write(`  ✔ ${t}\n`);
       },
       fail(t?: string) {
-        if (t) process.stderr.write(`  ✖ ${t}\n`);
+        if (t) stream.write(`  ✖ ${t}\n`);
       },
       warn(t?: string) {
-        if (t) process.stderr.write(`  ⚠ ${t}\n`);
+        if (t) stream.write(`  ⚠ ${t}\n`);
       },
       info(t?: string) {
-        if (t) process.stderr.write(`  ℹ ${t}\n`);
+        if (t) stream.write(`  ℹ ${t}\n`);
       },
       stop() {
         // no-op for static mode
@@ -57,7 +62,7 @@ export function startSpinner(text: string): SpinnerHandle {
 
   const spinner: Ora = ora({
     text,
-    stream: process.stderr,
+    stream,
     spinner: 'dots',
     indent: 2,
     isEnabled: true,

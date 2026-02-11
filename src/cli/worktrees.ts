@@ -7,7 +7,9 @@ import {
   isClean,
   mergeBranch,
   removeWorktree,
-  resolveWorktreePath
+  resolveWorktreePath,
+  stashPop,
+  stashPush
 } from '../git/operations.js';
 import { readFile, rename, rm, stat } from 'node:fs/promises';
 import { join, resolve as resolvePath } from 'node:path';
@@ -125,7 +127,7 @@ export async function mergeBackIfSafe(args: {
   sourceBranch: string;
   jobBranch: string;
   allowNoFf?: boolean;
-}): Promise<{ merged: boolean; reason?: string }> {
+}): Promise<{ merged: boolean; reason?: string; autostash?: { used: boolean; popHadConflicts?: boolean } }> {
   const repo = git(args.repoRoot);
 
   if (!args.sourceBranch || args.sourceBranch === 'HEAD') {
@@ -138,13 +140,33 @@ export async function mergeBackIfSafe(args: {
   }
 
   // Avoid merging into a dirty working tree.
-  const clean = await isClean(repo, { ignoreNibblerEngineArtifacts: true }).catch(() => false);
+  let clean = await isClean(repo, { ignoreNibblerEngineArtifacts: true }).catch(() => false);
+  let usedAutostash = false;
   if (!clean) {
-    return { merged: false, reason: 'working_tree_not_clean' };
+    // Make this transparent: stash, merge, then restore the stash.
+    const pushed = await stashPush(repo, {
+      includeUntracked: true,
+      message: `nibbler:auto-stash:merge:${args.jobBranch}:${Date.now()}:${process.pid}`,
+    }).catch(() => ({ stashed: false, output: '' }));
+    usedAutostash = pushed.stashed;
+    clean = await isClean(repo, { ignoreNibblerEngineArtifacts: true }).catch(() => false);
+    if (!clean) {
+      return { merged: false, reason: 'working_tree_not_clean', autostash: { used: usedAutostash } };
+    }
   }
 
   await mergeBranch(repo, args.jobBranch, { ffOnly: true, allowNoFf: args.allowNoFf ?? true });
-  return { merged: true };
+  if (usedAutostash) {
+    const popped = await stashPop(repo).catch(() => ({ applied: false, hadConflicts: true, output: '' }));
+    if (!popped.applied && popped.hadConflicts) {
+      return { merged: true, reason: 'autostash_pop_conflicts', autostash: { used: true, popHadConflicts: true } };
+    }
+    // Even if pop failed without obvious conflicts, keep merge as success but surface a reason for UX.
+    if (!popped.applied) {
+      return { merged: true, reason: 'autostash_pop_failed', autostash: { used: true, popHadConflicts: false } };
+    }
+  }
+  return { merged: true, autostash: usedAutostash ? { used: true, popHadConflicts: false } : { used: false } };
 }
 
 export async function cleanupJobWorktreeBestEffort(args: {

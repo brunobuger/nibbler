@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import { runInitCommand } from './commands/init.js';
 import { runBuildCommand } from './commands/build.js';
+import { runFixCommand } from './commands/fix.js';
 import { runStatusCommand } from './commands/status.js';
 import { runListCommand } from './commands/list.js';
 import { runHistoryCommand } from './commands/history.js';
@@ -102,6 +103,40 @@ export function buildCli(argv: string[]) {
       if (!globalFlags.quiet) {
         const r = getRenderer();
         r.success(`Build complete: job ${res.jobId}`);
+      }
+    });
+
+  program
+    .command('fix')
+    .description('Apply fixes to an existing job')
+    .argument('[instructions]', 'Fix instructions (what to change)')
+    .option('--job <id>', 'Job ID to fix (defaults to interactive picker)')
+    .option('--file <path>', 'Read fix instructions from file')
+    .action(async (instructions: string | undefined, opts: { job?: string; file?: string }) => {
+      const res = await runFixCommand({
+        instructions,
+        job: opts.job,
+        file: opts.file,
+      });
+      if (!res.ok) {
+        if ((res.details as any)?.reason === 'cancelled' || (res.details as any)?.details?.reason === 'cancelled') {
+          const r = getRenderer();
+          r.warn('Cancelled.');
+          process.exitCode = 130;
+          return;
+        }
+        const r = getRenderer();
+        r.error(
+          'Fix failed',
+          formatUnknown(res.details ?? 'unknown error'),
+          'Check the evidence directory for details, or run with --verbose.',
+        );
+        process.exitCode = 1;
+        return;
+      }
+      if (!globalFlags.quiet) {
+        const r = getRenderer();
+        r.success(`Fix complete: job ${res.jobId}`);
       }
     });
 

@@ -4,22 +4,20 @@
 roles:
   # The Architect role typically produces plans and resolves escalations.
   - id: architect
-    # Scope is enforced post-hoc via git diff checks.
-    # Keep it narrow; overlaps should be declared in sharedScopes.
     scope:
-      - "src/**"
-      - "tests/**"
-      - "README.md"
-      - "docs/**"
+      - "vision.md"
+      - "architecture.md"
     authority:
       # Cursor CLI command allow-list (optional).
       allowedCommands:
         - "npm test"
         - "npm run lint"
-      allowedPaths: []
+      # NOTE: Architect write access is intentionally broad. This reduces retries during scaffold/triage.
+      # Nibbler still blocks engine-protected paths like `.nibbler/**`, Cursor rule files, and `.git/**`.
+      allowedPaths: ["**/*"]
     outputExpectations:
       - "planning artifacts"
-      - "architecture decisions"
+      - "delegation plan"
     verificationMethod:
       # v1 supports `none` (completion criteria are phase-level).
       kind: "none"
@@ -29,28 +27,93 @@ roles:
       # Escalation target when budget is exhausted.
       exhaustionEscalation: "exception_gate"
 
-  # A generic worker role that implements changes.
-  - id: worker
+  # Implementation engineers own TDD for production code.
+  - id: backend
     scope:
-      - "src/**"
-      - "tests/**"
+      - "backend/**"
+      - "shared/**"
+      - "tests/backend/**"
     authority:
       allowedCommands:
         - "npm test"
       allowedPaths: []
     outputExpectations:
       - "implementation"
+      - "feature-level tests (TDD)"
     verificationMethod:
       kind: "none"
     budget:
       maxIterations: 3
       exhaustionEscalation: "architect"
+    behavioralGuidance: |
+      Own TDD: red → green → refactor.
+      Start by writing/updating tests, then implement the minimal change to pass.
+      Leave the test suite green at the end of your session.
+
+  # Frontend engineers also own TDD for frontend/UI changes (if your repo has a frontend surface).
+  - id: frontend
+    scope:
+      - "frontend/**"
+      - "shared/**"
+      - "tests/frontend/**"
+    authority:
+      allowedCommands:
+        - "npm test"
+      allowedPaths: []
+    outputExpectations:
+      - "implementation"
+      - "feature-level tests (TDD)"
+    verificationMethod:
+      kind: "none"
+    budget:
+      maxIterations: 3
+      exhaustionEscalation: "architect"
+    behavioralGuidance: |
+      Own TDD: red → green → refactor.
+      Start by writing/updating tests, then implement the minimal change to pass.
+      Leave the test suite green at the end of your session.
+
+  # SDET complements engineers by owning test infra and system-level quality.
+  - id: sdet
+    scope:
+      - "tests/**"
+      - "e2e/**"
+      - ".github/**"
+    authority:
+      allowedCommands:
+        - "npm test"
+      allowedPaths: []
+    outputExpectations:
+      - "test harness/CI improvements"
+      - "integration/e2e coverage"
+      - "flake reduction"
+    verificationMethod:
+      kind: "none"
+    budget:
+      maxIterations: 2
+      exhaustionEscalation: "architect"
+
+  # Docs/Ship role owns README quality.
+  - id: docs
+    scope:
+      - "README.md"
+      - "docs/**"
+    authority:
+      allowedCommands: []
+      allowedPaths: []
+    outputExpectations:
+      - "README.md (ship-ready)"
+    verificationMethod:
+      kind: "none"
+    budget:
+      maxIterations: 2
+      exhaustionEscalation: "architect"
 
 # If two roles can touch the same files, declare it explicitly.
 sharedScopes:
-  - roles: ["architect", "worker"]
+  - roles: ["backend", "frontend", "sdet"]
     patterns:
-      - "src/**"
+      - "shared/**"
       - "tests/**"
 
 # Optional escalation steps (engine can also use role budget exhaustionEscalation).

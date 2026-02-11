@@ -59,7 +59,7 @@ describe('SessionController plan mode', () => {
     const profilePath = join(repoRoot, '.nibbler', 'config', 'cursor-profiles', 'worker', 'cli-config.json');
     const profile = await readFile(profilePath, 'utf8');
     expect(profile).toContain('Write(.nibbler-staging/**)');
-    expect(profile).toContain('Write(**/*)');
+    expect(profile).not.toContain('Write(**/*)');
   });
 });
 

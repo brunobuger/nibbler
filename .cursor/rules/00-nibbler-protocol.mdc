@@ -1,9 +1,13 @@
 # Nibbler Protocol
 
-Emit exactly one of these single-line events when done:
+When your work is complete, signal the engine by outputting exactly ONE of these single-line events as **plain text in your response**:
 
 ```text
 NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"<short summary>"}
 NIBBLER_EVENT {"type":"NEEDS_ESCALATION","reason":"<what blocked you>","context":"<optional>"}
 NIBBLER_EVENT {"type":"EXCEPTION","reason":"<product decision needed>","impact":"<impact>"}
 ```
+
+**IMPORTANT**: The NIBBLER_EVENT line is a protocol signal parsed from your text output.
+NEVER write it inside any file (README.md, source code, config, etc.).
+It must only appear as text in your response after all file edits are done.

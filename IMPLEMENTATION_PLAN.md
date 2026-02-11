@@ -153,8 +153,8 @@ The implementation is divided into **10 phases**, each building on the previous.
 | 4 | **Session Controller** | Cursor CLI lifecycle, context injection, swap | Sessions can be spawned and managed |
 | 5 | **Gate Controller** | Interactive PO gates, resolution recording | Gates can be presented and resolved |
 | 6 | **Job Manager** | Orchestration loop, state machine, escalation | End-to-end execution pipeline |
-| 7 | **Discovery Engine** | Interview, document ingestion, vision synthesis | `nibbler build` discovery phase works |
-| 8 | **Init Bootstrap** | Contract proposal, validation loop, PO confirm | `nibbler init` fully functional |
+| 7 | **Discovery Engine** | Interview, document ingestion, vision synthesis | `nibbler init` discovery step works (vision.md + architecture.md) |
+| 8 | **Init Bootstrap** | Discovery (if missing) + contract proposal, validation loop, PO confirm | `nibbler init` fully functional |
 | 9 | **End-to-End Integration** | Full pipeline, `build` command, error recovery | Complete happy path works |
 | 10 | **Polish & Secondary Commands** | `fix`, `status`, `list`, `history`, `resume`, docs | Feature-complete v1 |
 
@@ -946,18 +946,17 @@ Provide 2–3 example contracts for common project types. These are suggestions 
 
 ## Phase 9 — End-to-End Integration
 
-**Goal:** Wire everything together into a working `nibbler build` command. Test the full pipeline from discovery through ship.
+**Goal:** Wire everything together into a working `nibbler build` command. Test the full pipeline from planning through ship (discovery artifacts are produced during `nibbler init`).
 
 ### 9.1. Build Command (`src/cli/commands/build.ts`)
 
 Parses arguments:
 - `nibbler build "requirement"` — Natural language description
-- `--file <path>` — Input documents (repeatable)
-- `--dry-run` — Discovery + planning only
-- `--skip-discovery` — Use existing `vision.md`
-- `--skip-scaffold` — Don't scaffold even if repo looks empty
+- `--file <path>` — Accepted (repeatable). Currently reserved; discovery inputs are handled by `nibbler init --file`.
+- `--dry-run` — Print the contract-defined execution plan summary (no agent sessions run)
+- `--skip-scaffold` — Accepted. Currently a hint; scaffolding is controlled by the contract phases.
 
-Creates a new job and runs the full pipeline via `JobManager.runJob()`.
+Creates a new job and runs the contract-defined phase graph via `JobManager.runContractJob()`.
 
 ### 9.2. Integration Testing
 
@@ -976,17 +975,13 @@ End-to-end tests that exercise the full pipeline:
 
 ### 9.3. Dry Run Mode
 
-`nibbler build --dry-run` runs discovery and planning, then prints:
-- The delegation plan (which roles, what tasks, what order)
-- Expected artifacts
-- Budget allocations
-- Gates that would be encountered
+`nibbler build --dry-run` prints a contract-defined execution plan summary (roles + scopes, phases + successors, gates), without running any agent sessions.
 
 This is invaluable for testing and for PO review before committing to a full run.
 
 ### Phase 9 Exit Criteria
 
-- `nibbler build "requirement"` runs the complete pipeline end-to-end
+- `nibbler build "requirement"` runs the complete contract-defined pipeline end-to-end (planning → execution → ship)
 - Happy path produces a branch with linear commit history
 - Error recovery works (scope violations, budget exhaustion, gate rejections)
 - Dry run mode shows the execution plan without running sessions
@@ -1226,7 +1221,7 @@ Phases 4 and 5 can be developed in parallel. Phases 7 and 8 can be developed in 
 A feature-complete v1 means:
 
 1. **`nibbler init`** produces a validated governance contract via Architect session
-2. **`nibbler build`** runs the full pipeline: discovery → planning → scaffold → execution → ship
+2. **`nibbler build`** runs the full pipeline: planning → scaffold → execution → ship (with discovery artifacts produced during init)
 3. **All 17 meta-rules** are enforced at contract validation and runtime
 4. **PO gates** (PLAN, SHIP, EXCEPTION) work interactively via CLI
 5. **Scope enforcement** via post-hoc diff analysis with revert + retry

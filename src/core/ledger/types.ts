@@ -23,6 +23,8 @@ export const LedgerEventType = z.enum([
   'session_start',
   'session_complete',
   'session_reverted',
+  // Cross-attempt feedback digest for workers (agent-friendly summary).
+  'session_feedback',
   'session_escalated',
   'scope_check',
   'completion_check',
@@ -64,9 +66,19 @@ export const GateResolvedEvent = z.object({
   type: z.literal('gate_resolved'),
   data: z.object({
     gateId: z.string(),
+    trigger: z.string().optional(),
     audience: z.string(),
     decision: z.enum(['approve', 'reject', 'exception']).optional(),
-    notes: z.string().optional()
+    notes: z.string().optional(),
+    /**
+     * Deterministic fingerprint used to avoid re-prompting for the same gate
+     * when nothing relevant changed (e.g. recovery/resume).
+     */
+    fingerprint: z.string().optional(),
+    /**
+     * Planning artifact tree digest, included when the gate originates from planning.
+     */
+    planningArtifactsSha256: z.string().optional(),
   })
 });
 

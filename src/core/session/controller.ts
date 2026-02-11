@@ -9,10 +9,16 @@ import type { BudgetSpec } from '../contract/types.js';
 import type { SessionHandle, SessionOutcome } from './types.js';
 import { SessionHealthMonitor } from './health.js';
 import type { DelegationTask } from '../delegation/types.js';
+import { readFile } from 'node:fs/promises';
 
 export interface SessionControllerOptions {
   inactivityTimeoutMs?: number;
   bootstrapPrompt?: string;
+}
+
+export interface WaitForCompletionOptions {
+  onHeartbeat?: (args: { nowIso: string; lastActivityAtIso: string }) => void | Promise<void>;
+  heartbeatIntervalMs?: number;
 }
 
 export type SessionMode = 'plan' | 'implement';
@@ -69,22 +75,84 @@ export class SessionController {
     const safe = roleId.replaceAll(/[^a-zA-Z0-9_-]/g, '_');
     const overlayRel = `.cursor/rules/20-role-${safe}.mdc`;
     const protocolRel = `.cursor/rules/00-nibbler-protocol.mdc`;
+    const workflowRel = `.cursor/rules/10-nibbler-workflow.mdc`;
 
     const basePrompt = options.bootstrapPrompt ?? this.opts.bootstrapPrompt;
-    const prompt = basePrompt
-      ? `${basePrompt}\n\nRead and follow:\n- ${overlayRel}\n- ${protocolRel}\n`
-      : `Read and follow:\n- ${overlayRel}\n- ${protocolRel}\n\nBegin your assigned work as described in the overlay.\n`;
+    const inlineRules = shouldInlineRules();
+    const rulesHeader = `Read and follow:\n- @${overlayRel}\n- @${workflowRel}\n- @${protocolRel}`;
+    let rulesPayload = `${rulesHeader}\n\nBegin your assigned work as described in the role overlay.\n`;
+
+    if (inlineRules) {
+      let overlayText = '';
+      let protocolText = '';
+      let workflowText = '';
+      try {
+        overlayText = await readFile(joinPath(this.workspace, overlayRel), 'utf8');
+      } catch {
+        // ignore
+      }
+      try {
+        protocolText = await readFile(joinPath(this.workspace, protocolRel), 'utf8');
+      } catch {
+        // ignore
+      }
+      try {
+        workflowText = await readFile(joinPath(this.workspace, workflowRel), 'utf8');
+      } catch {
+        // ignore
+      }
+
+      const inlinedRules = [
+        '',
+        '---',
+        `BEGIN ${overlayRel}`,
+        overlayText || '(missing)',
+        `END ${overlayRel}`,
+        '---',
+        `BEGIN ${workflowRel}`,
+        workflowText || '(missing)',
+        `END ${workflowRel}`,
+        '---',
+        `BEGIN ${protocolRel}`,
+        protocolText || '(missing)',
+        `END ${protocolRel}`,
+        '---',
+        ''
+      ].join('\n');
+      rulesPayload = `${rulesHeader}\n${inlinedRules}`;
+    }
+
+    const prompt = basePrompt ? `${basePrompt}\n\n${rulesPayload}` : rulesPayload;
 
     await this.runner.send(handle, prompt);
     return handle;
   }
 
-  async waitForCompletion(handle: SessionHandle, budget: BudgetSpec): Promise<SessionOutcome> {
+  async waitForCompletion(
+    handle: SessionHandle,
+    budget: BudgetSpec,
+    options: WaitForCompletionOptions = {}
+  ): Promise<SessionOutcome> {
     const inactivityTimeoutMs = this.opts.inactivityTimeoutMs ?? 60_000;
+    const heartbeatIntervalMs = options.heartbeatIntervalMs ?? 2_000;
 
     let inactive = false;
     let dead = false;
     let budgetExceeded = false;
+
+    const emitHeartbeat = () => {
+      if (!options.onHeartbeat) return;
+      const nowIso = new Date().toISOString();
+      const lastActivityAtIso = handle.lastActivityAtIso || nowIso;
+      Promise.resolve(options.onHeartbeat({ nowIso, lastActivityAtIso })).catch(() => {
+        // best-effort heartbeat callback
+      });
+    };
+    let heartbeatTimer: NodeJS.Timeout | null = null;
+    if (options.onHeartbeat) {
+      emitHeartbeat();
+      heartbeatTimer = setInterval(() => emitHeartbeat(), heartbeatIntervalMs);
+    }
 
     const monitor = new SessionHealthMonitor(handle, budget, {
       inactivityTimeoutMs,
@@ -93,12 +161,16 @@ export class SessionController {
     });
     monitor.onInactive(() => {
       inactive = true;
+      // In `--print` mode, the agent may hang without emitting events/output.
+      // Stop the runner so stdout closes and the loop below can return.
+      void this.runner.stop(handle);
     });
     monitor.onProcessDeath(() => {
       dead = true;
     });
     monitor.onBudgetExceeded(() => {
       budgetExceeded = true;
+      void this.runner.stop(handle);
     });
     monitor.start();
 
@@ -108,12 +180,23 @@ export class SessionController {
         return { kind: 'event', event: ev };
       }
 
-      if (budgetExceeded) return { kind: 'inactive_timeout' };
+      if (budgetExceeded) return { kind: 'budget_exceeded' };
       if (inactive) return { kind: 'inactive_timeout' };
-      if (dead) return { kind: 'process_exit', exitCode: null, signal: 'dead' };
-      return { kind: 'process_exit', exitCode: null, signal: null };
+      if (dead) {
+        return {
+          kind: 'process_exit',
+          exitCode: handle.exitCode ?? null,
+          signal: handle.signal ?? 'dead'
+        };
+      }
+      return {
+        kind: 'process_exit',
+        exitCode: handle.exitCode ?? null,
+        signal: handle.signal ?? null
+      };
     } finally {
       monitor.stop();
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
     }
   }
 
@@ -140,5 +223,9 @@ function joinPath(root: string, rel: string): string {
   // Avoid importing node:path in core hot path; keep simple.
   if (rel.startsWith('/')) return rel;
   return `${root.replace(/\/+$/, '')}/${rel.replace(/^\/+/, '')}`;
+}
+
+function shouldInlineRules(): boolean {
+  return process.env.NIBBLER_INLINE_RULES === '1';
 }
 

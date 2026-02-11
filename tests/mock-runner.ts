@@ -54,6 +54,7 @@ export class MockRunnerAdapter implements RunnerAdapter {
 
   readonly startedRoles: string[] = [];
   readonly startedSessions: Array<{ roleId: string; mode: 'normal' | 'plan'; taskType: RunnerTaskType }> = [];
+  readonly startedSessionLogs: Array<{ roleId: string; mode: 'normal' | 'plan'; logPath?: string }> = [];
 
   constructor(private actions: Record<string, RoleAction> = {}) {}
 
@@ -63,19 +64,20 @@ export class MockRunnerAdapter implements RunnerAdapter {
 
   async spawn(
     workspacePath: string,
-    _envVars: Record<string, string>,
+    envVars: Record<string, string>,
     configDir: string,
     options?: { mode?: 'normal' | 'plan'; interactive?: boolean; taskType?: RunnerTaskType }
   ): Promise<SessionHandle> {
     const roleId = basename(configDir);
     const id = `h-${Math.random().toString(16).slice(2)}`;
     const now = new Date().toISOString();
-    const handle: SessionHandle = { id, startedAtIso: now, lastActivityAtIso: now, pid: 1 };
+    const handle: SessionHandle = { id, startedAtIso: now, lastActivityAtIso: now, pid: 1, exitCode: null, signal: null };
 
     this.startedRoles.push(roleId);
     const mode = options?.mode ?? 'normal';
     const taskType: RunnerTaskType = options?.taskType ?? (mode === 'plan' ? 'plan' : 'execute');
     this.startedSessions.push({ roleId, mode, taskType });
+    this.startedSessionLogs.push({ roleId, mode, logPath: envVars.NIBBLER_SESSION_LOG_PATH });
     this.roleByHandle.set(id, roleId);
     this.modeByHandle.set(id, mode);
     this.taskTypeByHandle.set(id, taskType);
@@ -136,6 +138,8 @@ export class MockRunnerAdapter implements RunnerAdapter {
     if (!interactive) ended = true;
 
     if (ended) {
+      handle.exitCode = 0;
+      handle.signal = null;
       q.close();
       this.alive.delete(handle.id);
     }

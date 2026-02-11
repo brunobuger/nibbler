@@ -2,19 +2,6 @@
 ## This file defines the phase graph, gates, and global lifetime budget.
 
 phases:
-  # Discovery produces `vision.md` and `architecture.md`.
-  - id: discovery
-    actors: ["architect"]
-    inputBoundaries: ["**/*"]
-    outputBoundaries: ["vision.md", "architecture.md"]
-    preconditions:
-      - { type: "always" }
-    completionCriteria:
-      - { type: "artifact_exists", pattern: "vision.md" }
-      - { type: "artifact_exists", pattern: "architecture.md" }
-    successors:
-      - { on: "done", next: "planning" }
-
   # Planning produces job-local artifacts in `.nibbler/jobs/<id>/plan/`.
   - id: planning
     actors: ["architect"]
@@ -29,13 +16,30 @@ phases:
 
   # Execution performs implementation work.
   - id: execution
-    actors: ["worker"]
-    inputBoundaries: ["src/**", "tests/**"]
-    outputBoundaries: ["src/**", "tests/**"]
+    actors: ["backend", "frontend", "sdet"]
+    inputBoundaries: ["backend/**", "frontend/**", "shared/**", "tests/**", "e2e/**"]
+    outputBoundaries: ["backend/**", "frontend/**", "shared/**", "tests/**", "e2e/**"]
     preconditions:
       - { type: "always" }
     completionCriteria:
       - { type: "diff_non_empty" }
+      - { type: "command_succeeds", command: "npm test" }
+    successors:
+      - { on: "done", next: "ship" }
+
+  # Ship produces release-ready docs (README) and then triggers the final SHIP gate.
+  - id: ship
+    actors: ["docs"]
+    inputBoundaries: ["**/*"]
+    outputBoundaries: ["README.md", "docs/**"]
+    preconditions:
+      - { type: "always" }
+    completionCriteria:
+      - { type: "artifact_exists", pattern: "README.md" }
+      - { type: "markdown_has_headings", path: "README.md", requiredHeadings: ["Install", "Quickstart", "Commands", "Local development"], minChars: 400 }
+      # Optional: if the repo runs a local dev server, enforce a deterministic boot check.
+      # Example (Vite): start dev server and verify the default URL responds.
+      - { type: "local_http_smoke", startCommand: "npm run dev -- --host 127.0.0.1 --port 5173 --strictPort", url: "http://127.0.0.1:5173/", timeoutMs: 60000, requestTimeoutMs: 5000 }
     successors: []
     isTerminal: true
 
@@ -44,11 +48,46 @@ gates:
   - id: plan
     trigger: "planning->execution"
     audience: "PO"
+    approvalScope: "build_requirements"
+    approvalExpectations:
+      - "Approve the product requirements and MVP build scope for this job."
+      - "Approve the execution plan and delegation approach before implementation starts."
+    businessOutcomes:
+      - "The team is aligned on business value, priorities, and acceptance outcomes for this build."
+      - "The PO approves proceeding to implementation with the planned scope."
+    functionalScope:
+      - "Core user workflows from vision.md are mapped to concrete implementation tasks."
+      - "Acceptance criteria and handoff artifacts define what must be delivered in execution."
+    outOfScope:
+      - "Features not listed in approved planning artifacts are excluded from this build."
+      - "Strategic roadmap and post-MVP work are not approved by this gate."
     requiredInputs:
+      - { name: "vision", kind: "path", value: "vision.md" }
+      - { name: "architecture", kind: "path", value: "architecture.md" }
       - { name: "acceptance", kind: "path", value: ".nibbler/jobs/<id>/plan/acceptance.md" }
     outcomes:
       approve: "execution"
       reject: "planning"
+
+  # Final SHIP gate after the terminal phase completes.
+  # Convention: use `${terminalPhaseId}->__END__` to run a gate at the very end.
+  - id: ship
+    trigger: "ship->__END__"
+    audience: "PO"
+    approvalScope: "phase_output"
+    approvalExpectations:
+      - "Approve final ship artifacts for release readiness."
+    businessOutcomes:
+      - "PO confirms the delivered output is acceptable for release."
+    functionalScope:
+      - "README and release-facing docs are complete for install, quickstart, and operations."
+    outOfScope:
+      - "This gate does not approve additional features beyond delivered artifacts."
+    requiredInputs:
+      - { name: "readme", kind: "path", value: "README.md" }
+    outcomes:
+      approve: "__END__"
+      reject: "ship"
 
 globalLifetime:
   # Global time budget for the job.

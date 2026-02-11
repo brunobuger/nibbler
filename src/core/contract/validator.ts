@@ -75,6 +75,18 @@ export function validateContract(contract: Contract): ValidationError[] {
 
   // Domain 2 — Artifact Flow (Rule 2.1)
   for (const phase of contract.phases) {
+    // Actors must exist (structural sanity).
+    for (const actor of phase.actors ?? []) {
+      const exists = contract.roles.some((r) => r.id === actor);
+      if (!exists) {
+        errors.push({
+          rule: '2.1',
+          message: `Phase '${phase.id}' references unknown actor role '${actor}'`,
+          details: { phaseId: phase.id, actor }
+        });
+      }
+    }
+
     if (!phase.inputBoundaries || phase.inputBoundaries.length === 0) {
       errors.push({ rule: '2.1', message: `Rule 2.1: Phase '${phase.id}' has no input boundaries` });
     }
@@ -86,6 +98,32 @@ export function validateContract(contract: Contract): ValidationError[] {
         rule: '3.1',
         message: `Rule 3.1: Phase '${phase.id}' has no completion criteria`
       });
+    }
+
+    // Output boundaries must be producible by at least one actor scope.
+    //
+    // This is a deterministic contract-quality guardrail that prevents impossible phases such as:
+    // - scaffold phase owned by "architect" but writing package.json while architect scope excludes it.
+    // - phases declaring outputs that no actor can touch (guaranteed scope violations at runtime).
+    //
+    // EXCEPTION: Engine-managed paths (e.g. `.nibbler/jobs/**/plan/**`) are written by the orchestration
+    // engine itself, not by the actor's file-system scope. Requiring actor scope coverage for these would
+    // create an unsolvable conflict with Rule 5.3 (protected paths cannot appear in scopes).
+    const actors = (phase.actors ?? []).filter((a) => contract.roles.some((r) => r.id === a));
+    if (actors.length > 0 && Array.isArray(phase.outputBoundaries)) {
+      const uncovered: Array<{ boundary: string; actors: string[] }> = [];
+      for (const boundary of phase.outputBoundaries) {
+        if (isEngineManagedPath(boundary)) continue;
+        const ok = actors.some((a) => outputBoundaryCoveredByRole(boundary, a, contract));
+        if (!ok) uncovered.push({ boundary, actors });
+      }
+      for (const u of uncovered) {
+        errors.push({
+          rule: '1.2',
+          message: `Phase '${phase.id}' outputBoundary '${u.boundary}' is not covered by any actor scope/sharedScope`,
+          details: { phaseId: phase.id, outputBoundary: u.boundary, actors: u.actors }
+        });
+      }
     }
   }
 
@@ -169,9 +207,150 @@ function shouldRequireUpstreamProducer(inputBoundary: string): boolean {
   return p.startsWith('.nibbler/') || p.startsWith('.nibbler\\');
 }
 
+/**
+ * Engine-managed paths are written by the Nibbler orchestration engine itself (e.g. planning
+ * artifacts under `.nibbler/jobs/`). They live under protected paths and thus cannot — and
+ * should not — be covered by any actor's file-system scope. Rule 1.2 coverage checks must
+ * skip these to avoid an unsolvable conflict with Rule 5.3 (protected path exclusion).
+ */
+function isEngineManagedPath(boundary: string): boolean {
+  const p = boundary.trim();
+  if (!p) return false;
+  return p.startsWith('.nibbler/') || p.startsWith('.nibbler\\');
+}
+
+function outputBoundaryCoveredByRole(boundary: string, roleId: string, contract: Contract): boolean {
+  const role = contract.roles.find((r) => r.id === roleId);
+  if (!role) return false;
+
+  const shared = contract.sharedScopes
+    .filter((s) => s.roles.includes(roleId))
+    .flatMap((s) => (s.patterns?.length ? s.patterns : ['**/*']));
+
+  const extra = role.authority?.allowedPaths ?? [];
+  const patterns = [...(role.scope ?? []), ...shared, ...extra].filter(Boolean);
+  return patterns.some((p) => scopePatternCoversBoundary(p, boundary));
+}
+
+/**
+ * Conservative "coverage" heuristic: does a scope glob pattern include everything in a boundary pattern?
+ * We only handle the common contract shapes used by Nibbler templates:
+ * - Exact files: "package.json"
+ * - Folder globs: "frontend/**"
+ * - Broad globs: "** / *" (written with spaces here to avoid ending this comment)
+ *
+ * For more complex globs we fall back to prefix checks + a literal match check when boundary is a file path.
+ */
+function scopePatternCoversBoundary(scopePat: string, boundaryPat: string): boolean {
+  const s = String(scopePat ?? '').trim();
+  const b = String(boundaryPat ?? '').trim();
+  if (!s || !b) return false;
+
+  if (s === '**/*') return true;
+  if (s === b) return true;
+
+  // If scope is a directory glob, require boundary to be under that directory.
+  if (s.endsWith('/**')) {
+    const prefix = s.slice(0, -3).replace(/\/+$/, '');
+    if (!prefix) return true;
+    return b === prefix || b.startsWith(prefix + '/');
+  }
+
+  // If scope is a single-level directory glob, treat it as covering files directly under that dir.
+  if (s.endsWith('/*')) {
+    const prefix = s.slice(0, -2).replace(/\/+$/, '');
+    if (!prefix) return true;
+    return b.startsWith(prefix + '/') && !b.slice(prefix.length + 1).includes('/');
+  }
+
+  // If boundary looks like a literal file path (no glob meta), use picomatch for exact match.
+  if (!/[*?[\]{}()!+@]/.test(b)) {
+    try {
+      const isMatch = picomatch(s, { dot: true });
+      return isMatch(b);
+    } catch {
+      // ignore
+    }
+  }
+
+  // Fallback: static prefix containment.
+  const sp = staticPrefix(s);
+  const bp = staticPrefix(b);
+  if (sp.length === 0) return false;
+  if (bp.length === 0) return false;
+  return bp.startsWith(sp);
+}
+
 function validateGates(gates: GateDefinition[]): ValidationError[] {
   const errors: ValidationError[] = [];
   for (const gate of gates) {
+    if (!gate.approvalScope) {
+      errors.push({ rule: '3.2', message: `Rule 3.2: Gate '${gate.id}' must declare approvalScope` });
+    }
+
+    if (!Array.isArray(gate.approvalExpectations)) {
+      errors.push({
+        rule: '3.2',
+        message: `Rule 3.2: Gate '${gate.id}' must declare approvalExpectations`
+      });
+    }
+
+    if (!Array.isArray(gate.businessOutcomes)) {
+      errors.push({ rule: '3.2', message: `Rule 3.2: Gate '${gate.id}' must declare businessOutcomes` });
+    }
+
+    if (!Array.isArray(gate.functionalScope)) {
+      errors.push({ rule: '3.2', message: `Rule 3.2: Gate '${gate.id}' must declare functionalScope` });
+    }
+
+    if (!Array.isArray(gate.outOfScope)) {
+      errors.push({ rule: '3.2', message: `Rule 3.2: Gate '${gate.id}' must declare outOfScope` });
+    }
+
+    if ((gate.approvalScope === 'build_requirements' || gate.approvalScope === 'both') && gate.approvalExpectations.length === 0) {
+      errors.push({
+        rule: '3.2',
+        message: `Rule 3.2: Gate '${gate.id}' with approvalScope='${gate.approvalScope}' must include approvalExpectations`
+      });
+    }
+
+    if (isPlanningPoGate(gate)) {
+      if (gate.approvalScope !== 'build_requirements' && gate.approvalScope !== 'both') {
+        errors.push({
+          rule: '3.2',
+          message: `Rule 3.2: Planning PO gate '${gate.id}' must use approvalScope 'build_requirements' or 'both'`
+        });
+      }
+
+      if (!hasPathInput(gate, 'vision.md')) {
+        errors.push({
+          rule: '3.2',
+          message: `Rule 3.2: Planning PO gate '${gate.id}' must include required input 'vision.md'`
+        });
+      }
+
+      if (!hasPathInput(gate, 'architecture.md')) {
+        errors.push({
+          rule: '3.2',
+          message: `Rule 3.2: Planning PO gate '${gate.id}' must include required input 'architecture.md'`
+        });
+      }
+
+      if (!gate.businessOutcomes || gate.businessOutcomes.length === 0) {
+        errors.push({
+          rule: '3.2',
+          message: `Rule 3.2: Planning PO gate '${gate.id}' must include non-empty businessOutcomes`
+        });
+      }
+
+      if (!gate.functionalScope || gate.functionalScope.length === 0) {
+        errors.push({
+          rule: '3.2',
+          message: `Rule 3.2: Planning PO gate '${gate.id}' must include non-empty functionalScope`
+        });
+      }
+    }
+
     if (!gate.outcomes || typeof gate.outcomes !== 'object') {
       errors.push({ rule: '3.4', message: `Rule 3.4: Gate '${gate.id}' has no outcomes` });
       continue;
@@ -184,6 +363,29 @@ function validateGates(gates: GateDefinition[]): ValidationError[] {
     }
   }
   return errors;
+}
+
+function isPlanningPoGate(gate: GateDefinition): boolean {
+  if (gate.audience !== 'PO') return false;
+  const source = String(gate.trigger ?? '')
+    .split('->')[0]
+    ?.trim()
+    .toLowerCase();
+  return source === 'planning';
+}
+
+function hasPathInput(gate: GateDefinition, pathLeaf: string): boolean {
+  const target = pathLeaf.toLowerCase();
+  for (const input of gate.requiredInputs ?? []) {
+    if (input.kind !== 'path') continue;
+    const value = String(input.value ?? '')
+      .replaceAll('\\', '/')
+      .toLowerCase();
+    if (value === target || value.endsWith(`/${target}`) || value.includes(target)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function validatePhaseGraph(phases: PhaseDefinition[]): ValidationError[] {

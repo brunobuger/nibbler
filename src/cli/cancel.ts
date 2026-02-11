@@ -35,13 +35,22 @@ export function installCliCancellation(opts: {
    * Called on the second+ cancellation trigger. Defaults to `process.exit(...)`.
    * Use this to force exit if graceful shutdown is stuck (e.g., blocked in a prompt).
    */
-  onForceExit?: (info: CancelInfo & { count: number }) => void;
+  onForceExit?: (info: CancelInfo & { count: number }) => void | Promise<void>;
 } = {}): InstalledCliCancellation {
   const controller = new AbortController();
   _activeCancelSignal = controller.signal;
 
   let count = 0;
   let disposed = false;
+  let resumedStdin = false;
+  let cancelPromise: Promise<void> | null = null;
+  let forceExitInProgress = false;
+
+  // Give cleanup enough time to propagate SIGTERM + force-kill (runner uses 5s delay).
+  const forceExitGraceMs = (() => {
+    const raw = Number(process.env.NIBBLER_FORCE_EXIT_GRACE_MS ?? '');
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 6_500;
+  })();
 
   const defaultForceExit = (info: CancelInfo & { count: number }) => {
     // Conventional exit codes:
@@ -63,7 +72,7 @@ export function installCliCancellation(opts: {
         // ignore
       }
       if (opts.onCancel) {
-        Promise.resolve(opts.onCancel(info)).catch(() => {
+        cancelPromise = Promise.resolve(opts.onCancel(info)).catch(() => {
           // best-effort; never throw from signal path
         });
       }
@@ -71,11 +80,20 @@ export function installCliCancellation(opts: {
     }
 
     // Second trigger: force exit.
-    try {
-      (opts.onForceExit ?? defaultForceExit)({ ...info, count });
-    } catch {
-      defaultForceExit({ ...info, count });
-    }
+    if (forceExitInProgress) return;
+    forceExitInProgress = true;
+    void (async () => {
+      const payload = { ...info, count };
+      try {
+        const waits: Array<Promise<void>> = [];
+        if (opts.onForceExit) waits.push(withTimeout(Promise.resolve(opts.onForceExit(payload)), forceExitGraceMs));
+        if (cancelPromise) waits.push(withTimeout(cancelPromise, forceExitGraceMs));
+        if (waits.length > 0) await Promise.allSettled(waits);
+      } catch {
+        // ignore; force-exit path must not throw
+      }
+      defaultForceExit(payload);
+    })();
   };
 
   const onSigint = () => trigger({ signal: 'SIGINT', source: 'signal' });
@@ -97,7 +115,22 @@ export function installCliCancellation(opts: {
   if (wantsStdin) {
     process.stdin.on('data', onStdinData);
     // Ensure stdin is flowing while we're listening.
-    process.stdin.resume();
+    // IMPORTANT: remember if *we* resumed stdin, so we can restore it on dispose.
+    try {
+      const wasPaused = typeof (process.stdin as any).isPaused === 'function' ? (process.stdin as any).isPaused() : false;
+      if (wasPaused) {
+        process.stdin.resume();
+        resumedStdin = true;
+      }
+    } catch {
+      // Best-effort fallback: resume, and assume we should pause on dispose.
+      try {
+        process.stdin.resume();
+        resumedStdin = true;
+      } catch {
+        // ignore
+      }
+    }
   }
 
   const dispose = () => {
@@ -107,9 +140,11 @@ export function installCliCancellation(opts: {
     process.off('SIGTERM', onSigterm);
     if (wantsStdin) {
       process.stdin.off('data', onStdinData);
-      // Avoid keeping the process alive if we were the only data listener.
+      // Avoid keeping the process alive.
+      // We may have put stdin into flowing mode (resume). Restore prior state
+      // deterministically even if other libraries briefly keep data listeners.
       try {
-        if (process.stdin.listenerCount('data') === 0) process.stdin.pause();
+        if (resumedStdin) process.stdin.pause();
       } catch {
         // ignore
       }
@@ -126,5 +161,19 @@ export function installCliCancellation(opts: {
     },
     dispose,
   };
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<void> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    await Promise.race([
+      promise.then(() => undefined).catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => resolve(), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 

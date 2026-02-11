@@ -87,6 +87,7 @@ describe('JobManager (scope violation retry)', () => {
 
     const ledgerContent = await readFile(jobPaths.ledgerPath, 'utf8');
     expect((ledgerContent.match(/"type":"session_reverted"/g) ?? []).length).toBe(1);
+    expect((ledgerContent.match(/"type":"session_feedback"/g) ?? []).length).toBe(1);
 
     const count = await execa('git', ['rev-list', '--count', 'HEAD'], { cwd: repoRoot });
     expect(Number(count.stdout.trim())).toBeGreaterThanOrEqual(2);

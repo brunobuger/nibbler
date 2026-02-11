@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, readdir, rm, stat } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 import { execa } from 'execa';
 
@@ -11,7 +11,7 @@ import { CursorRunnerAdapter } from '../../core/session/cursor-adapter.js';
 import type { RunnerAdapter } from '../../core/session/runner.js';
 import type { SessionHandle } from '../../core/session/types.js';
 import { fileExists, readText, writeJson, writeText, writeYaml } from '../../utils/fs.js';
-import { initWorkspace, writeProtocolRule, writeRoleOverlay } from '../../workspace/layout.js';
+import { initWorkspace, writeProtocolRule, writeRoleOverlay, writeWorkflowRules } from '../../workspace/layout.js';
 import { scanProjectState } from '../../workspace/scanner.js';
 import { renderInitBootstrapPrompt } from '../../templates/bootstrap-prompt.js';
 import { commit, git, isClean } from '../../git/operations.js';
@@ -56,6 +56,14 @@ export async function runInitCommand(opts: InitCommandOptions = {}): Promise<{ o
         }
       }
     },
+    onForceExit: async () => {
+      if (!activeHandle) return;
+      try {
+        await runner.stop(activeHandle);
+      } catch {
+        // best-effort
+      }
+    }
   });
 
   try {
@@ -98,7 +106,7 @@ export async function runInitCommand(opts: InitCommandOptions = {}): Promise<{ o
     r.workspaceScan({
       repoPath: repoRoot,
       isClean: repoClean,
-      hasCode: project.kind === 'existing',
+      hasCode: project.kind === 'has_code',
       language,
       fileCount,
       hasArchitecture: project.hasArchitectureMd,
@@ -373,14 +381,7 @@ export async function runInitCommand(opts: InitCommandOptions = {}): Promise<{ o
       r.blank();
 
     // ── Step 4: Contract Summary + PO Approval ─────────────────────────────
-    r.contractSummary(
-      {
-        roles: proposed.roles.map((role) => ({ id: role.id, scope: role.scope })),
-        phases: proposed.phases.map((p) => ({ id: p.id, isTerminal: p.isTerminal })),
-        gates: proposed.gates.map((g) => ({ id: g.id, audience: String(g.audience), trigger: g.trigger })),
-      },
-      ['.nibbler/contract/team.yaml', '.nibbler/contract/phases.yaml'],
-    );
+    r.contractSummary(proposed, ['.nibbler/contract/team.yaml', '.nibbler/contract/phases.yaml']);
 
       const decision = await getInitDecision();
 
@@ -395,6 +396,30 @@ export async function runInitCommand(opts: InitCommandOptions = {}): Promise<{ o
       r.warn('Contract rejected. Sending feedback to Architect...');
       r.blank();
       continue;
+    }
+
+    // ── Step 4.5: Generate workflow rules (AI) ─────────────────────────────
+    const workflow = await generateWorkflowRulesBestEffort({
+      repoRoot,
+      runner,
+      contract: proposed,
+      projectSummary: {
+        kind: project.kind,
+        projectType: project.projectType ?? null,
+        traits: project.traits ?? [],
+        topLevelEntries: project.topLevelEntries ?? [],
+        packageJsonPreview: project.packageJsonPreview ?? null,
+      },
+    });
+    if (workflow?.content) {
+      if (!opts.dryRun) {
+        // Commit a durable workflow rule file so every subsequent agent session shares consistent guidance.
+        await writeWorkflowRules(repoRoot, workflow.content);
+      } else {
+        r.dim('Dry run: workflow rules generated in staging only (not written to .cursor/rules).');
+      }
+    } else {
+      r.warn('Workflow rules were not generated. Continuing without them.');
     }
 
     // ── Step 5: Commit ─────────────────────────────────────────────────────
@@ -599,7 +624,7 @@ function defaultProtocolRule(): string {
   return [
     '# Nibbler Protocol',
     '',
-    'Emit exactly one of these single-line events when done:',
+    'When your work is complete, signal the engine by outputting exactly ONE of these single-line events as **plain text in your response**:',
     '',
     '```text',
     'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"<short summary>"}',
@@ -607,7 +632,152 @@ function defaultProtocolRule(): string {
     'NIBBLER_EVENT {"type":"EXCEPTION","reason":"<product decision needed>","impact":"<impact>"}',
     '```',
     '',
+    '**IMPORTANT**: The NIBBLER_EVENT line is a protocol signal parsed from your text output.',
+    'NEVER write it inside any file (README.md, source code, config, etc.).',
+    'It must only appear as text in your response after all file edits are done.',
+    '',
   ].join('\n');
+}
+
+async function generateWorkflowRulesBestEffort(args: {
+  repoRoot: string;
+  runner: RunnerAdapter;
+  contract: Contract;
+  projectSummary: {
+    kind: string;
+    projectType: string | null;
+    traits: string[];
+    topLevelEntries: string[];
+    packageJsonPreview: unknown;
+  };
+}): Promise<{ content: string; stagedRel: string } | null> {
+  const r = getRenderer();
+  const { repoRoot, runner, contract, projectSummary } = args;
+
+  const stagedRel = '.nibbler-staging/rules/10-nibbler-workflow.mdc';
+  const stagedAbs = join(repoRoot, stagedRel);
+  await mkdir(dirname(stagedAbs), { recursive: true });
+
+  // Use a dedicated Cursor CLI config directory whose basename is `rules` so tests can target it.
+  const configDir = join(repoRoot, '.nibbler', 'config', 'cursor-profiles', 'rules');
+  await mkdir(configDir, { recursive: true });
+  await writeJson(join(configDir, 'cli-config.json'), rulesWriterCliConfig());
+
+  const roleLines = contract.roles
+    .map((role) => {
+      const scope = role.scope.slice(0, 12).map((s) => `\`${s}\``).join(', ');
+      const suffix = role.scope.length > 12 ? `, ... (+${role.scope.length - 12} more)` : '';
+      return `- ${role.id}: scope=${scope}${suffix}`;
+    })
+    .join('\n');
+
+  const sharedLines = (contract.sharedScopes ?? [])
+    .map((s) => `- roles=[${s.roles.join(', ')}] patterns=${(s.patterns?.length ? s.patterns : ['**/*']).join(', ')}`)
+    .join('\n');
+
+  const prompt = [
+    'You are an AI agent writing a durable workflow rules file for this repository.',
+    '',
+    '## Goal',
+    'Write a concise, high-signal Cursor rules file that helps future agent sessions succeed in this repo.',
+    'This file MUST reflect the dynamically assembled team and scopes from the Nibbler contract below.',
+    '',
+    '## Output (REQUIRED)',
+    `Write the workflow rules file to exactly: ${stagedRel}`,
+    '',
+    '## Contract (source of truth for team + scopes)',
+    'Summarize the team and encode guidance that matches these exact roles/scopes.',
+    '',
+    'Roles:',
+    roleLines || '(none)',
+    '',
+    'Shared scopes:',
+    sharedLines || '(none)',
+    '',
+    '## Stable project signals (for durable rules)',
+    `- projectType: ${String(projectSummary.projectType ?? '(unknown)')}`,
+    `- traits: ${(projectSummary.traits ?? []).join(', ') || '(none)'}`,
+    '',
+    '## Required sections (use markdown headings)',
+    '- Commands (how to run tests/build/lint; do not invent commands; reference package.json scripts if present)',
+    '- Workflow (how to work: edit first then run checks; avoid long-running commands first; keep changes scoped)',
+    '- Team map (role -> owned areas; explain how to request help/escalate)',
+    '- Handoffs (recommended; where to write them; include a short template)',
+    '',
+    '## Handoff convention (MUST include in the rules)',
+    '- Write per-session handoff (recommended) to: `.nibbler-staging/<jobId>/handoffs/<roleId>-<phaseId>.md`',
+    '- Read previous handoffs from: `.nibbler/jobs/<jobId>/plan/handoffs/`',
+    '',
+    '## Constraints',
+    '- Keep it concise (target 80–200 lines).',
+    '- Prefer repo-specific guidance over generic advice.',
+    '- Do NOT mention transient bootstrap state (examples: `docs_only`, `early-stage`, `missing package.json`).',
+    '- Avoid caveats tied to the current snapshot of files; rules must stay valid after scaffold/build.',
+    '- Do NOT modify any repository files except the required output file above.',
+    '',
+    'After writing the rules file, signal completion by outputting this as plain text in your response (NOT inside any file):',
+    '',
+    '```',
+    'NIBBLER_EVENT {"type":"PHASE_COMPLETE","summary":"workflow rules written"}',
+    '```',
+  ].join('\n');
+
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const spinner = r.spinner(attempt === 1 ? 'Generating workflow rules...' : `Re-trying workflow rules (attempt ${attempt})...`);
+    const start = Date.now();
+    let handle: SessionHandle | null = null;
+    try {
+      handle = await runner.spawn(repoRoot, {}, configDir, { mode: 'plan', taskType: 'plan' });
+      await runner.send(handle, prompt);
+      await waitForInitCompletion(runner, handle);
+      await runner.stop(handle);
+
+      const exists = await fileExists(stagedAbs);
+      if (!exists) {
+        spinner.fail(`Workflow rules missing ${theme.dim(`(${formatMs(Date.now() - start)})`)}`);
+        continue;
+      }
+      const content = await readText(stagedAbs);
+      if (content.trim().length < 200) {
+        spinner.fail(`Workflow rules too short ${theme.dim(`(${formatMs(Date.now() - start)})`)}`);
+        continue;
+      }
+      spinner.succeed(`Workflow rules ready ${theme.dim(`(${formatMs(Date.now() - start)})`)}`);
+      return { content, stagedRel };
+    } catch (err: any) {
+      spinner.fail(`Workflow rules failed ${theme.dim(`(${formatMs(Date.now() - start)})`)}`);
+      if (isVerbose()) r.dim(`workflow rules error: ${String(err?.message ?? err)}`);
+    } finally {
+      if (handle) {
+        try {
+          await runner.stop(handle);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function rulesWriterCliConfig(): any {
+  // Plan-mode: read-only, except staging writes.
+  return {
+    version: 1,
+    editor: { vimMode: false },
+    permissions: {
+      allow: ['Read(**/*)', 'Write(.nibbler-staging/**)'],
+      deny: [
+        'Write(.nibbler/**)',
+        'Write(.cursor/**)',
+        'Read(.env*)',
+        'Read(**/.env*)',
+        'Write(**/*.key)',
+      ],
+    },
+  };
 }
 
 function formatArtifactQualitySummary(reports: ArtifactQualityReport[]): string {

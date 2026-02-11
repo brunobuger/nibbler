@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { execa } from 'execa';
 
@@ -56,15 +56,15 @@ describe('JobManager (scope exception grant)', () => {
           authority: { allowedCommands: [], allowedPaths: [] },
           outputExpectations: [],
           verificationMethod: { kind: 'none' },
-          budget: { maxIterations: 3, exhaustionEscalation: 'architect' }
+          budget: { maxIterations: 2, exhaustionEscalation: 'architect' }
         }
       ],
       phases: [
         {
-          id: 'p1',
+          id: 'execution',
           actors: ['worker'],
-          inputBoundaries: ['src/**'],
-          outputBoundaries: ['src/**'],
+          inputBoundaries: ['src/**', 'docs/**'],
+          outputBoundaries: ['src/**', 'docs/**'],
           preconditions: [{ type: 'always' }],
           completionCriteria: [{ type: 'diff_non_empty' }],
           successors: [],
@@ -77,10 +77,19 @@ describe('JobManager (scope exception grant)', () => {
       escalationChain: []
     };
 
+    let retryPrompt = '';
     const runner = new MockRunnerAdapter({
-      worker: async ({ workspacePath, attempt }) => {
+      worker: async ({ workspacePath, attempt, mode, message }) => {
+        if (mode === 'plan') {
+          // Delegated execution requires role-local implementation plan materialization first.
+          const planDir = join(workspacePath, '.nibbler-staging', 'j-test', 'plans');
+          await mkdir(planDir, { recursive: true });
+          await writeFile(join(planDir, 'worker-plan.md'), '# worker plan\n', 'utf8');
+          return;
+        }
         // Attempt 1: touch out-of-scope docs file.
         // Attempt 2+: same file should be accepted after grant.
+        if (attempt >= 2) retryPrompt = message;
         await mkdir(join(workspacePath, 'docs'), { recursive: true });
         await writeFile(join(workspacePath, 'docs', 'granted.md'), `doc attempt=${attempt}\n`, 'utf8');
       },
@@ -109,14 +118,35 @@ describe('JobManager (scope exception grant)', () => {
     const job = {
       repoRoot,
       jobId: 'j-test',
-      currentPhaseId: 'p1',
+      currentPhaseId: 'execution',
+      mode: 'build' as const,
       startedAtIso: new Date().toISOString(),
-      statusPath: jobPaths.statusPath
+      statusPath: jobPaths.statusPath,
+      delegationPlan: {
+        version: 1,
+        tasks: [
+          {
+            taskId: 't1',
+            roleId: 'worker',
+            description: 'Write docs marker',
+            scopeHints: ['docs/granted.md'],
+            dependsOn: [],
+            priority: 1
+          }
+        ]
+      }
     };
 
-    const out = await jm.runJob(job, contract, { roles: ['worker'] });
+    const out = await jm.runContractJob(job as any, contract);
     expect(out.ok).toBe(true);
     expect(runner.startedRoles).toContain('architect');
+
+    const ledgerContent = await readFile(jobPaths.ledgerPath, 'utf8');
+    expect((ledgerContent.match(/"type":"scope_exception_granted"/g) ?? []).length).toBe(1);
+    expect((ledgerContent.match(/"type":"session_feedback"/g) ?? []).length).toBe(1);
+    expect(retryPrompt).toContain('## Retry feedback from engine (highest priority)');
+    expect(retryPrompt).toContain('Architect granted narrow scope access for: `docs/granted.md`.');
+    expect(retryPrompt).not.toContain('HARD blocklist for this retry: do NOT edit `docs/granted.md`.');
   });
 });
 

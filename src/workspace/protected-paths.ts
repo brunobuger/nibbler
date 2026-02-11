@@ -1,6 +1,9 @@
 import picomatch from 'picomatch';
 
 export const PROTECTED_PATH_PATTERNS = [
+  // Git internals must never be touched by agents.
+  // Worktrees rely on `.git/worktrees/**` metadata; changes here can brick the job workspace.
+  '.git/**',
   '.nibbler/**',
   '.cursor/rules/00-nibbler-protocol.mdc'
 ] as const;

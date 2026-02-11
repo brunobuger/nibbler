@@ -32,7 +32,13 @@ export interface ProjectState {
   hasSrcDir: boolean;
   topLevelEntries: string[];
   packageJsonPreview?: { name?: string; dependenciesCount?: number; devDependenciesCount?: number; bin?: unknown };
-  kind: 'greenfield' | 'existing';
+  /**
+   * Coarse repository state used for init/scaffold decisions.
+   * - empty: no code and no durable docs
+   * - docs_only: has durable docs, but no code scaffold yet
+   * - has_code: has package.json and/or src/ (or other code signals)
+   */
+  kind: 'empty' | 'docs_only' | 'has_code';
   projectType?: ProjectType;
   traits?: string[];
   classificationConfidence?: Confidence;
@@ -89,8 +95,13 @@ export async function scanProjectState(repoRoot: string): Promise<ProjectState> 
     }
   }
 
-  // "existing" = the repo has meaningful content (code or documentation) for the Architect to use.
-  const kind: ProjectState['kind'] = hasPackageJson || hasSrcDir || hasArchitectureMd || hasPrdMd ? 'existing' : 'greenfield';
+  // Repo state: distinguish docs-only from code-bearing repos so init can propose scaffold phases/roles.
+  const kind: ProjectState['kind'] =
+    hasPackageJson || hasSrcDir
+      ? 'has_code'
+      : hasArchitectureMd || hasVisionMd || hasPrdMd
+        ? 'docs_only'
+        : 'empty';
 
   const classification = await classifyProject(repoRoot).catch(() => null);
 

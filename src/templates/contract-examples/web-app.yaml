@@ -1,31 +1,51 @@
 roles:
   - id: architect
-    scope: ["src/**", "tests/**", "docs/**", "README.md"]
-    authority: { allowedCommands: ["npm test", "npm run lint"], allowedPaths: [] }
-    outputExpectations: ["plan artifacts", "architecture decisions"]
+    scope: ["vision.md", "architecture.md"]
+    authority: { allowedCommands: ["npm test", "npm run lint"], allowedPaths: ["**/*"] }
+    outputExpectations: ["planning artifacts", "delegation plan"]
     verificationMethod: { kind: "none" }
     budget: { maxIterations: 2, exhaustionEscalation: "exception_gate" }
-  - id: worker
-    scope: ["src/**", "tests/**"]
+
+  - id: backend
+    scope: ["backend/**", "shared/**", "tests/backend/**"]
     authority: { allowedCommands: ["npm test"], allowedPaths: [] }
-    outputExpectations: ["implementation"]
+    outputExpectations: ["implementation", "tests (feature-level)"]
     verificationMethod: { kind: "none" }
     budget: { maxIterations: 3, exhaustionEscalation: "architect" }
+    behavioralGuidance: |
+      Own TDD for backend changes: red → green → refactor.
+      Start by writing/updating tests, then implement the smallest change to pass.
+      Leave the suite green at the end of your session.
+
+  - id: frontend
+    scope: ["frontend/**", "shared/**", "tests/frontend/**"]
+    authority: { allowedCommands: ["npm test"], allowedPaths: [] }
+    outputExpectations: ["implementation", "tests (feature-level)"]
+    verificationMethod: { kind: "none" }
+    budget: { maxIterations: 3, exhaustionEscalation: "architect" }
+    behavioralGuidance: |
+      Own TDD for frontend changes: red → green → refactor.
+      Add/adjust tests with each behavior change; keep increments small and keep the suite green.
+
+  - id: sdet
+    scope: ["tests/**", "e2e/**", ".github/**"]
+    authority: { allowedCommands: ["npm test"], allowedPaths: [] }
+    outputExpectations: ["test strategy/infra", "integration/e2e coverage", "flake reduction"]
+    verificationMethod: { kind: "none" }
+    budget: { maxIterations: 2, exhaustionEscalation: "architect" }
+
+  - id: docs
+    scope: ["README.md", "docs/**"]
+    authority: { allowedCommands: [], allowedPaths: [] }
+    outputExpectations: ["README.md (ship-ready)"]
+    verificationMethod: { kind: "none" }
+    budget: { maxIterations: 2, exhaustionEscalation: "architect" }
 
 sharedScopes:
-  - roles: ["architect", "worker"]
-    patterns: ["src/**", "tests/**"]
+  - roles: ["backend", "frontend", "sdet"]
+    patterns: ["shared/**", "tests/**"]
 
 phases:
-  - id: discovery
-    actors: ["architect"]
-    inputBoundaries: ["**/*"]
-    outputBoundaries: ["vision.md", "architecture.md"]
-    preconditions: [{ type: "always" }]
-    completionCriteria:
-      - { type: "artifact_exists", pattern: "vision.md" }
-      - { type: "artifact_exists", pattern: "architecture.md" }
-    successors: [{ on: "done", next: "planning" }]
   - id: planning
     actors: ["architect"]
     inputBoundaries: ["vision.md", "architecture.md"]
@@ -34,12 +54,27 @@ phases:
     completionCriteria:
       - { type: "artifact_exists", pattern: ".nibbler/jobs/**/plan/**" }
     successors: [{ on: "done", next: "execution" }]
+
   - id: execution
-    actors: ["worker"]
-    inputBoundaries: ["src/**", "tests/**"]
-    outputBoundaries: ["src/**", "tests/**"]
+    actors: ["backend", "frontend", "sdet"]
+    inputBoundaries: ["backend/**", "frontend/**", "shared/**", "tests/**", "e2e/**"]
+    outputBoundaries: ["backend/**", "frontend/**", "shared/**", "tests/**", "e2e/**"]
     preconditions: [{ type: "always" }]
-    completionCriteria: [{ type: "diff_non_empty" }]
+    completionCriteria:
+      - { type: "diff_non_empty" }
+      - { type: "command_succeeds", command: "npm test" }
+    successors: [{ on: "done", next: "ship" }]
+
+  - id: ship
+    actors: ["docs"]
+    inputBoundaries: ["**/*"]
+    outputBoundaries: ["README.md", "docs/**"]
+    preconditions: [{ type: "always" }]
+    completionCriteria:
+      - { type: "artifact_exists", pattern: "README.md" }
+      - { type: "markdown_has_headings", path: "README.md", requiredHeadings: ["Install", "Quickstart", "Commands", "Local development"], minChars: 400 }
+      # Optional but recommended: ensure the app actually boots locally (example for Vite).
+      - { type: "local_http_smoke", startCommand: "npm run dev -- --host 127.0.0.1 --port 5173 --strictPort", url: "http://127.0.0.1:5173/", timeoutMs: 60000, requestTimeoutMs: 5000 }
     successors: []
     isTerminal: true
 
@@ -47,9 +82,39 @@ gates:
   - id: plan
     trigger: "planning->execution"
     audience: "PO"
+    approvalScope: "build_requirements"
+    approvalExpectations:
+      - "Approve the product requirements and MVP scope for this web app build."
+      - "Approve the implementation plan and delegation before execution."
+    businessOutcomes:
+      - "Stakeholders are aligned on value delivery for the approved MVP."
+      - "The PO authorizes implementation under the approved scope and priorities."
+    functionalScope:
+      - "User-facing workflows in vision.md are mapped to executable work items."
+      - "Acceptance artifacts define the expected behavior to be delivered."
+    outOfScope:
+      - "Any feature not represented in approved planning artifacts is out of scope."
+      - "Future roadmap enhancements are explicitly deferred."
     requiredInputs:
-      - { name: "discovery", kind: "path", value: ".nibbler/jobs/<id>/plan/discovery.json" }
+      - { name: "vision", kind: "path", value: "vision.md" }
+      - { name: "architecture", kind: "path", value: "architecture.md" }
     outcomes: { approve: "execution", reject: "planning" }
+
+  - id: ship
+    trigger: "ship->__END__"
+    audience: "PO"
+    approvalScope: "phase_output"
+    approvalExpectations:
+      - "Approve ship-phase deliverables for release readiness."
+    businessOutcomes:
+      - "The release package is approved for handoff."
+    functionalScope:
+      - "README and docs provide installation, quickstart, and command guidance."
+    outOfScope:
+      - "No additional implementation scope is approved at SHIP."
+    requiredInputs:
+      - { name: "readme", kind: "path", value: "README.md" }
+    outcomes: { approve: "__END__", reject: "ship" }
 
 globalLifetime:
   maxTimeMs: 1800000

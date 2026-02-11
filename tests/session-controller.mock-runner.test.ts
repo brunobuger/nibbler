@@ -41,6 +41,57 @@ class AsyncQueue<T> implements AsyncIterable<T> {
 class MockRunner implements RunnerAdapter {
   private qByHandle = new Map<string, AsyncQueue<NibblerEvent>>();
   private alive = new Set<string>();
+  private lastMessageByHandle = new Map<string, string>();
+
+  capabilities(): RunnerCapabilities {
+    return { interactive: false, permissions: true, streamJson: false };
+  }
+
+  async spawn(
+    _workspacePath: string,
+    _envVars: Record<string, string>,
+    _configDir: string,
+    _options?: { mode?: 'normal' | 'plan'; interactive?: boolean }
+  ): Promise<SessionHandle> {
+    const id = `h-${Math.random().toString(16).slice(2)}`;
+    const now = new Date().toISOString();
+    const handle: SessionHandle = { id, startedAtIso: now, lastActivityAtIso: now, pid: 1 };
+    this.qByHandle.set(id, new AsyncQueue<NibblerEvent>());
+    this.alive.add(id);
+    return handle;
+  }
+
+  async send(handle: SessionHandle, message: string): Promise<void> {
+    handle.lastActivityAtIso = new Date().toISOString();
+    const q = this.qByHandle.get(handle.id);
+    if (!q) throw new Error('missing queue');
+    this.lastMessageByHandle.set(handle.id, message);
+    q.push({ type: 'PHASE_COMPLETE', summary: 'ok' });
+    q.close();
+    this.alive.delete(handle.id);
+  }
+
+  readEvents(handle: SessionHandle): AsyncIterable<NibblerEvent> {
+    const q = this.qByHandle.get(handle.id);
+    if (!q) throw new Error('missing queue');
+    return q;
+  }
+
+  isAlive(handle: SessionHandle): boolean {
+    return this.alive.has(handle.id);
+  }
+
+  async stop(_handle: SessionHandle): Promise<void> {}
+
+  getLastMessage(handleId: string): string | undefined {
+    return this.lastMessageByHandle.get(handleId);
+  }
+}
+
+class HangingRunner implements RunnerAdapter {
+  private qByHandle = new Map<string, AsyncQueue<NibblerEvent>>();
+  private alive = new Set<string>();
+  stopCount = 0;
 
   capabilities(): RunnerCapabilities {
     return { interactive: false, permissions: true, streamJson: false };
@@ -62,11 +113,6 @@ class MockRunner implements RunnerAdapter {
 
   async send(handle: SessionHandle, _message: string): Promise<void> {
     handle.lastActivityAtIso = new Date().toISOString();
-    const q = this.qByHandle.get(handle.id);
-    if (!q) throw new Error('missing queue');
-    q.push({ type: 'PHASE_COMPLETE', summary: 'ok' });
-    q.close();
-    this.alive.delete(handle.id);
   }
 
   readEvents(handle: SessionHandle): AsyncIterable<NibblerEvent> {
@@ -79,7 +125,11 @@ class MockRunner implements RunnerAdapter {
     return this.alive.has(handle.id);
   }
 
-  async stop(_handle: SessionHandle): Promise<void> {}
+  async stop(handle: SessionHandle): Promise<void> {
+    this.stopCount += 1;
+    this.alive.delete(handle.id);
+    this.qByHandle.get(handle.id)?.close();
+  }
 }
 
 describe('SessionController (mock runner)', () => {
@@ -127,6 +177,9 @@ describe('SessionController (mock runner)', () => {
     const sc = new SessionController(runner, repoRoot, { inactivityTimeoutMs: 5_000, bootstrapPrompt: 'go' });
 
     const handle = await sc.startSession('worker', job, contract);
+    const sent = runner.getLastMessage(handle.id) ?? '';
+    expect(sent).toContain('Read and follow:');
+    expect(sent).not.toContain('BEGIN .cursor/rules/20-role-worker.mdc');
 
     const overlayPath = join(repoRoot, '.cursor', 'rules', '20-role-worker.mdc');
     const overlay = await readFile(overlayPath, 'utf8');
@@ -138,6 +191,119 @@ describe('SessionController (mock runner)', () => {
 
     const outcome = await sc.waitForCompletion(handle, contract.roles[0].budget);
     expect(outcome.kind).toBe('event');
+  });
+
+  it('can inline rule files when explicitly enabled', async () => {
+    const prev = process.env.NIBBLER_INLINE_RULES;
+    process.env.NIBBLER_INLINE_RULES = '1';
+    try {
+      const repoRoot = await mkdtemp(join(tmpdir(), 'nibbler-session-inline-'));
+      await initWorkspace(repoRoot);
+
+      const contract: Contract = {
+        roles: [
+          {
+            id: 'worker',
+            scope: ['src/**'],
+            authority: { allowedCommands: [], allowedPaths: [] },
+            outputExpectations: [],
+            verificationMethod: { kind: 'none' },
+            budget: { maxIterations: 1, exhaustionEscalation: 'escalate' }
+          }
+        ],
+        phases: [
+          {
+            id: 'p1',
+            actors: ['worker'],
+            inputBoundaries: ['src/**'],
+            outputBoundaries: ['src/**'],
+            preconditions: [{ type: 'always' }],
+            completionCriteria: [{ type: 'diff_non_empty' }],
+            successors: [],
+            isTerminal: true
+          }
+        ],
+        gates: [],
+        globalLifetime: { maxTimeMs: 10_000 },
+        sharedScopes: [],
+        escalationChain: []
+      };
+
+      const job = {
+        repoRoot,
+        jobId: 'j-test',
+        currentPhaseId: 'p1',
+        startedAtIso: new Date().toISOString()
+      };
+
+      const runner = new MockRunner();
+      const sc = new SessionController(runner, repoRoot, { inactivityTimeoutMs: 5_000, bootstrapPrompt: 'go' });
+      const handle = await sc.startSession('worker', job, contract);
+
+      const sent = runner.getLastMessage(handle.id) ?? '';
+      expect(sent).toContain('BEGIN .cursor/rules/20-role-worker.mdc');
+
+      const outcome = await sc.waitForCompletion(handle, contract.roles[0].budget);
+      expect(outcome.kind).toBe('event');
+    } finally {
+      if (prev === undefined) delete process.env.NIBBLER_INLINE_RULES;
+      else process.env.NIBBLER_INLINE_RULES = prev;
+    }
+  });
+
+  it('reports budget timeout distinctly and emits heartbeats while active', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'nibbler-session-heartbeat-'));
+    await initWorkspace(repoRoot);
+
+    const contract: Contract = {
+      roles: [
+        {
+          id: 'worker',
+          scope: ['src/**'],
+          authority: { allowedCommands: [], allowedPaths: [] },
+          outputExpectations: [],
+          verificationMethod: { kind: 'none' },
+          budget: { maxIterations: 1, maxTimeMs: 50, exhaustionEscalation: 'escalate' }
+        }
+      ],
+      phases: [
+        {
+          id: 'p1',
+          actors: ['worker'],
+          inputBoundaries: ['src/**'],
+          outputBoundaries: ['src/**'],
+          preconditions: [{ type: 'always' }],
+          completionCriteria: [{ type: 'diff_non_empty' }],
+          successors: [],
+          isTerminal: true
+        }
+      ],
+      gates: [],
+      globalLifetime: { maxTimeMs: 10_000 },
+      sharedScopes: [],
+      escalationChain: []
+    };
+
+    const job = {
+      repoRoot,
+      jobId: 'j-test',
+      currentPhaseId: 'p1',
+      startedAtIso: new Date().toISOString()
+    };
+
+    const runner = new HangingRunner();
+    const sc = new SessionController(runner, repoRoot, { inactivityTimeoutMs: 30_000, bootstrapPrompt: 'go' });
+    const handle = await sc.startSession('worker', job, contract);
+
+    const beats: string[] = [];
+    const outcome = await sc.waitForCompletion(handle, contract.roles[0].budget, {
+      heartbeatIntervalMs: 100,
+      onHeartbeat: ({ nowIso }) => beats.push(nowIso)
+    });
+
+    expect(outcome.kind).toBe('budget_exceeded');
+    expect(runner.stopCount).toBeGreaterThan(0);
+    expect(beats.length).toBeGreaterThan(2);
   });
 });
 

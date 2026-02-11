@@ -18,15 +18,16 @@ import { initJob, initWorkspace } from '../../workspace/layout.js';
 import type { JobState } from '../../core/job/types.js';
 import { getRenderer } from '../ui/renderer.js';
 import { theme } from '../ui/theme.js';
-import { roleLabel } from '../ui/format.js';
+import { formatMs, roleLabel } from '../ui/format.js';
 import type { SpinnerHandle } from '../ui/spinner.js';
 import { installCliCancellation } from '../cancel.js';
 import { cleanupJobWorktreeBestEffort, mergeBackIfSafe, prepareJobWorktree } from '../worktrees.js';
-import { listJobIds, readJobStatus, isPidAlive } from '../jobs.js';
+import { listJobIds, readJobStatus, isPidAlive, readLedgerTail } from '../jobs.js';
 import { promptInput, promptSelect } from '../ui/prompts.js';
 import type { JobOutcome } from '../../core/job-manager.js';
 import { formatFailureForArchitect } from './recovery.js';
 import { runExistingJob } from './existing-job.js';
+import { resolveSessionInactivityTimeoutMs } from '../session-timeout.js';
 
 export interface BuildCommandOptions {
   repoRoot?: string;
@@ -48,8 +49,12 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
 
   // ── Pre-flight checks ────────────────────────────────────────────────────
   const repo = git(repoRoot);
-  if (!(await isClean(repo, { ignoreNibblerEngineArtifacts: true }))) {
-    return { ok: false, details: 'Working tree is not clean. Commit/stash changes before running nibbler build.' };
+  // Note: builds run in an isolated worktree. We don't require a clean working tree up-front.
+  // We will attempt a transparent auto-stash only if/when we need to merge results back.
+  // (This keeps the user’s current workspace intact during long-running builds.)
+  const startedDirty = !(await isClean(repo, { ignoreNibblerEngineArtifacts: true }).catch(() => true));
+  if (startedDirty && process.env.NIBBLER_VERBOSE === '1') {
+    r.warn('Working tree has local changes; build will run in a worktree and preserve them.');
   }
 
   const contract = await safeReadContract(join(repoRoot, '.nibbler', 'contract'));
@@ -118,10 +123,22 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
       }
 
       if (promptsEnabled) {
+        const budgetLine = formatBudgetLineFromStatus(status);
+        const pathsLine = `Evidence: .nibbler/jobs/${lastJobId}/evidence/ | Ledger: .nibbler/jobs/${lastJobId}/ledger.jsonl`;
+        const recentLine = await formatRecentLedgerLine(repoRoot, lastJobId);
+        const resumeWarning =
+          state === 'budget_exceeded'
+            ? `${theme.warning('Note:')} this job exceeded its global budget; resuming it will likely fail immediately.\n`
+            : '';
+
         const message =
           `Previous job found: ${theme.bold(lastJobId)} (${theme.bold(state)})\n` +
           `Phase: ${theme.bold(phase)}${role ? ` | Role: ${theme.bold(role)}` : ''} | ${completed}/${total} roles completed\n` +
           (running ? `Engine: running (pid=${status.engine_pid})\n` : '') +
+          (budgetLine ? `${budgetLine}\n` : '') +
+          `${pathsLine}\n` +
+          (recentLine ? `${recentLine}\n` : '') +
+          resumeWarning +
           'How would you like to proceed?';
 
         const choice = await promptSelect<'resume' | 'new'>({
@@ -177,7 +194,7 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
   const gates = new GateController(ledger, evidence);
 
   const runner = opts.runner ?? new CursorRunnerAdapter();
-  const sessions = new SessionController(runner, worktreePath, { inactivityTimeoutMs: 120_000 });
+  const sessions = new SessionController(runner, worktreePath, { inactivityTimeoutMs: resolveSessionInactivityTimeoutMs() });
 
   const jobStartTime = Date.now();
   const job: JobState = {
@@ -206,11 +223,14 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
   let activeRoleSpinner: SpinnerHandle | null = null;
   let activeRoleId: string | null = null;
 
-  const stopActiveRoleSpinner = (roleId: string, ok: boolean) => {
+  const stopActiveRoleSpinner = (
+    roleId: string,
+    args: { ok: boolean; successText?: string; failText?: string }
+  ) => {
     if (!activeRoleSpinner || activeRoleId !== roleId) return;
     const prefix = roleLabel(roleId);
-    if (ok) activeRoleSpinner.succeed(`${prefix}Session complete`);
-    else activeRoleSpinner.fail(`${prefix}Session needs revision`);
+    if (args.ok) activeRoleSpinner.succeed(`${prefix}${args.successText ?? 'Session complete'}`);
+    else activeRoleSpinner.fail(`${prefix}${args.failText ?? 'Session needs revision'}`);
     activeRoleSpinner = null;
     activeRoleId = null;
   };
@@ -227,20 +247,37 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
 
         // Planning contracts often require staged contract snapshots; ensure they exist.
         // If the Architect already wrote staged contract files, keep them as-is.
+        // NOTE: .nibbler/ is gitignored so contract files live in repoRoot, not the worktree.
         const stagedContractDir = join(worktreePath, '.nibbler-staging', 'contract');
         await mkdir(stagedContractDir, { recursive: true });
         const stagedTeam = join(stagedContractDir, 'team.yaml');
         const stagedPhases = join(stagedContractDir, 'phases.yaml');
         if (!(await fileExists(stagedTeam))) {
-          await copyFile(join(worktreePath, '.nibbler', 'contract', 'team.yaml'), stagedTeam);
+          const srcTeam = join(repoRoot, '.nibbler', 'contract', 'team.yaml');
+          if (await fileExists(srcTeam)) await copyFile(srcTeam, stagedTeam);
         }
         if (!(await fileExists(stagedPhases))) {
-          await copyFile(join(worktreePath, '.nibbler', 'contract', 'phases.yaml'), stagedPhases);
+          const srcPhases = join(repoRoot, '.nibbler', 'contract', 'phases.yaml');
+          if (await fileExists(srcPhases)) await copyFile(srcPhases, stagedPhases);
         }
       }
     },
 
     // ── Rendering hooks ──────────────────────────────────────────────────
+    onRolePlanStart: ({ roleId, attempt, maxAttempts }) => {
+      activeRoleSpinner?.stop();
+      activeRoleId = roleId;
+      activeRoleSpinner = r.spinner(`${roleLabel(roleId)}Preparing implementation plan (attempt ${attempt}/${maxAttempts})...`);
+    },
+
+    onRolePlanComplete: ({ roleId }) => {
+      stopActiveRoleSpinner(roleId, { ok: true, successText: 'Implementation plan ready' });
+    },
+
+    onRolePlanFailed: ({ roleId }) => {
+      stopActiveRoleSpinner(roleId, { ok: false, failText: 'Implementation plan failed; retrying...' });
+    },
+
     onRoleStart: ({ roleId, attempt, maxAttempts }) => {
       // If a previous spinner is still active (unexpected), stop it cleanly.
       activeRoleSpinner?.stop();
@@ -255,7 +292,7 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
     },
 
     onVerification: ({ roleId, scopePassed, completionPassed, scopeViolations, diff }) => {
-      stopActiveRoleSpinner(roleId, scopePassed && completionPassed);
+      stopActiveRoleSpinner(roleId, { ok: scopePassed && completionPassed });
 
       r.verificationStart(roleId);
       r.verificationResult(roleId, [
@@ -283,7 +320,7 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
     },
 
     onEscalation: ({ roleId, reason }) => {
-      stopActiveRoleSpinner(roleId, false);
+      stopActiveRoleSpinner(roleId, { ok: false });
       r.roleEscalation(roleId, reason);
     },
 
@@ -298,6 +335,9 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
       r.warn('Cancelling job...');
       await jm.cancel(job, { signal, reason: 'signal' });
     },
+    onForceExit: async () => {
+      await jm.stopActiveSession();
+    }
   });
   try {
     let out = await jm.runContractJob(job, contract);
@@ -313,6 +353,15 @@ export async function runBuildCommand(opts: BuildCommandOptions): Promise<{ ok: 
           return { ok: false, jobId, details: `Auto-merge skipped (${merged.reason}). Merge ${jobBranch} manually.` };
         }
         mergeSpinner.succeed(`Merged into ${theme.bold(sourceBranch)}`);
+        if (merged.reason === 'autostash_pop_conflicts') {
+          r.warn('Your local changes were stashed for the merge, but could not be fully restored cleanly.');
+          r.warn('Resolve the merge conflicts in your working tree (the stash entry should still exist).');
+          // The merge itself succeeded — don't fail the build for a stash-pop conflict.
+        }
+        if (merged.reason === 'autostash_pop_failed') {
+          r.warn('Merged successfully, but restoring your local changes failed.');
+          r.warn('Your stash entry should still exist; you can re-apply it manually.');
+        }
       } catch {
         mergeSpinner.fail('Merge failed');
         r.warn(`Job completed on ${theme.bold(jobBranch)} but could not be merged automatically.`);
@@ -396,7 +445,13 @@ async function runWithRecovery(args: {
       ...(guidance ? { userGuidance: guidance } : {}),
     };
 
-    out = await args.jm.runContractJobFromPhase(args.job, args.contract, pickFixStartPhase(args.contract));
+    // Recovery should restart from the failing phase when possible, to avoid re-triggering
+    // earlier PO gates (e.g. PLAN) unless the plan artifacts actually changed.
+    const validPhaseIds = new Set(args.contract.phases.map((p) => p.id));
+    const failingPhase = args.job.currentPhaseId && validPhaseIds.has(args.job.currentPhaseId) ? args.job.currentPhaseId : null;
+    const recoveryStart = failingPhase ?? pickFixStartPhase(args.contract);
+
+    out = await args.jm.runContractJobFromPhase(args.job, args.contract, recoveryStart);
     if (out.ok) return out;
     if (out.reason === 'cancelled') return out;
 
@@ -405,8 +460,16 @@ async function runWithRecovery(args: {
     if (attempt >= MAX_RECOVERY_ATTEMPTS) return out;
 
     r.blank();
-    r.warn('Autonomous recovery did not resolve the failure.');
+    r.warn(`Autonomous recovery did not resolve the failure (${String(out.reason)}).`);
+    const detailLines = formatOutcomeDetailsForUser(out);
+    for (const line of detailLines) r.dim(line);
     r.dim(`Evidence: .nibbler/jobs/${args.job.jobId}/evidence/`);
+    r.dim(`Ledger: .nibbler/jobs/${args.job.jobId}/ledger.jsonl`);
+    const recent = await formatRecentLedgerLine(args.job.repoRoot, args.job.jobId);
+    if (recent) r.dim(recent);
+    if (out.reason === 'budget_exceeded') {
+      r.warn('Global budget is exhausted; retries cannot succeed unless you start a new job (new budget) or increase `globalLifetime.maxTimeMs` in the contract.');
+    }
 
     const action = await promptSelect<'retry' | 'abort'>({
       message: 'How would you like to proceed?',
@@ -425,6 +488,55 @@ async function runWithRecovery(args: {
   return out;
 }
 
+function formatBudgetLineFromStatus(status: Awaited<ReturnType<typeof readJobStatus>>): string | null {
+  const state = String((status as any).state ?? '');
+  if (state !== 'budget_exceeded') return null;
+  const elapsed = (status as any)?.budget?.global?.elapsed_ms;
+  const limit = (status as any)?.budget?.global?.limit_ms;
+  if (typeof elapsed !== 'number') return null;
+  if (typeof limit !== 'number') return `Budget: global time ${formatMs(elapsed)} (limit: unknown)`;
+  const over = elapsed - limit;
+  const suffix = over > 0 ? ` (exceeded by ${formatMs(over)})` : '';
+  return `Budget: global time ${formatMs(elapsed)} / ${formatMs(limit)}${suffix}`;
+}
+
+async function formatRecentLedgerLine(repoRoot: string, jobId: string): Promise<string | null> {
+  try {
+    const tail = await readLedgerTail(repoRoot, jobId, 8);
+    const entries = Array.isArray(tail.entries) ? tail.entries : [];
+    const short = entries
+      .slice(-6)
+      .map((e: any) => {
+        const type = String(e?.type ?? 'event');
+        const role = e?.data?.role ? String(e.data.role) : null;
+        return role ? `${type}(${role})` : type;
+      })
+      .filter(Boolean);
+    if (!short.length) return null;
+    return `Recent: ${short.join(', ')}`;
+  } catch {
+    return null;
+  }
+}
+
+function formatOutcomeDetailsForUser(out: JobOutcome): string[] {
+  if (out.ok) return [];
+  if (out.reason === 'budget_exceeded') {
+    const exceeded = (out.details as any)?.exceeded;
+    const timeMs = exceeded?.timeMs;
+    if (timeMs && typeof timeMs.limit === 'number' && typeof timeMs.actual === 'number') {
+      const over = timeMs.actual - timeMs.limit;
+      return [
+        `Why: global time budget exceeded (${formatMs(timeMs.actual)} > ${formatMs(timeMs.limit)}${over > 0 ? `, over by ${formatMs(over)}` : ''})`,
+      ];
+    }
+    return ['Why: global time budget exceeded'];
+  }
+  if (out.reason === 'cancelled') return ['Why: cancelled'];
+  if (out.reason === 'escalated') return ['Why: escalated (manual intervention needed)'];
+  return [];
+}
+
 async function findLatestRecoverableJobForBuild(
   repoRoot: string
 ): Promise<{ jobId: string; status: Awaited<ReturnType<typeof readJobStatus>> } | null> {
@@ -436,7 +548,6 @@ async function findLatestRecoverableJobForBuild(
     const status = await readJobStatus(repoRoot, jobId);
     const state = String(status.state);
     if (state === 'completed') return null;
-    if (state === 'cancelled') return null;
     return { jobId, status };
   } catch {
     return null;

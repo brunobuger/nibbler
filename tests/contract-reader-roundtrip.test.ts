@@ -47,6 +47,11 @@ describe('contract reader/writer', () => {
           id: 'plan',
           trigger: 'start->end',
           audience: 'PO',
+          approvalScope: 'phase_output',
+          approvalExpectations: ['Approve phase output'],
+          businessOutcomes: ['Gate decision recorded'],
+          functionalScope: ['Transition to next phase is authorized'],
+          outOfScope: ['No additional scope change'],
           requiredInputs: [],
           outcomes: { approve: 'end', reject: 'start' }
         }

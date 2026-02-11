@@ -1,4 +1,4 @@
-import { execa, type ExecaChildProcess } from 'execa';
+import { execa } from 'execa';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { createWriteStream, type WriteStream } from 'node:fs';
@@ -10,7 +10,7 @@ import type { NibblerEvent, RunnerCapabilities, SessionHandle } from './types.js
 import { parseEventLine } from './event-parser.js';
 
 type ProcState = {
-  proc: ExecaChildProcess;
+  proc: ReturnType<typeof execa>;
   handle: SessionHandle;
   events: AsyncQueue<NibblerEvent>;
   log?: WriteStream;
@@ -18,6 +18,11 @@ type ProcState = {
   roleProfile: string;
   sentCount: number;
   logPath?: string;
+  mode: 'normal' | 'plan';
+  taskType: RunnerTaskType;
+  model: string | null;
+  lineCount: number;
+  eventCount: number;
 };
 
 class AsyncQueue<T> implements AsyncIterable<T> {
@@ -135,13 +140,51 @@ export class CursorRunnerAdapter implements RunnerAdapter {
     });
 
     handle.pid = proc.pid;
+    void proc
+      .then((result: any) => {
+        handle.exitCode = typeof result?.exitCode === 'number' ? result.exitCode : null;
+        handle.signal = typeof result?.signal === 'string' ? result.signal : null;
+        handle.lastActivityAtIso = new Date().toISOString();
+      })
+      .catch(() => {
+        handle.exitCode = typeof proc.exitCode === 'number' ? proc.exitCode : null;
+        const signal = (proc as any)?.signal;
+        handle.signal = typeof signal === 'string' ? signal : null;
+        handle.lastActivityAtIso = new Date().toISOString();
+      });
 
     const events = new AsyncQueue<NibblerEvent>();
-    this.byId.set(id, { proc, handle, events, log, interactive, roleProfile: basename(configDir), sentCount: 0, logPath });
+    const state: ProcState = {
+      proc,
+      handle,
+      events,
+      log,
+      interactive,
+      roleProfile: basename(configDir),
+      sentCount: 0,
+      logPath,
+      mode: options?.mode === 'plan' ? 'plan' : 'normal',
+      taskType,
+      model,
+      lineCount: 0,
+      eventCount: 0,
+    };
+    this.byId.set(id, state);
 
     this.attachParsers(id);
 
     proc.finally(() => {
+      if (handle.exitCode === undefined) {
+        handle.exitCode = typeof proc.exitCode === 'number' ? proc.exitCode : null;
+      }
+      if (handle.signal === undefined) {
+        const signal = (proc as any)?.signal;
+        handle.signal = typeof signal === 'string' ? signal : null;
+      }
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/25aab501-c72a-437e-b834-e0245fea140d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'build-e2e-retry',hypothesisId:'H4',location:'src/core/session/cursor-adapter.ts:spawn/finally',message:'cursor session finished',data:{roleProfile:state.roleProfile,mode:state.mode,taskType:state.taskType,model:state.model,interactive:state.interactive,sentCount:state.sentCount,lineCount:state.lineCount,eventCount:state.eventCount,exitCode:handle.exitCode ?? null,signal:handle.signal ?? null},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+      this.byId.delete(id);
       events.close();
       try {
         log?.write(`[nibbler] session end ${new Date().toISOString()}\n`);
@@ -210,10 +253,28 @@ export class CursorRunnerAdapter implements RunnerAdapter {
     if (!st) return;
     const proc = st.proc;
 
-    if (proc.exitCode !== null) return;
+    if (proc.exitCode === null) {
+      try {
+        proc.kill('SIGTERM');
+      } catch {
+        // ignore
+      }
+      await waitForProcessExit(proc, 1_500);
 
-    proc.kill('SIGTERM');
-    await proc.catch(() => undefined);
+      if (proc.exitCode === null) {
+        try {
+          proc.kill('SIGKILL');
+        } catch {
+          // ignore
+        }
+        await waitForProcessExit(proc, 2_500);
+      }
+    }
+
+    // Always close the event stream so callers waiting on readEvents can proceed
+    // even if the underlying process refuses to exit promptly.
+    st.events.close();
+    this.byId.delete(handle.id);
   }
 
   private mustGet(handle: SessionHandle): ProcState {
@@ -228,6 +289,7 @@ export class CursorRunnerAdapter implements RunnerAdapter {
 
     const onLine = (_source: 'stdout' | 'stderr', line: string) => {
       st.handle.lastActivityAtIso = new Date().toISOString();
+      st.lineCount += 1;
       try {
         st.log?.write(`${line}\n`);
       } catch {
@@ -236,14 +298,20 @@ export class CursorRunnerAdapter implements RunnerAdapter {
 
       // First, try direct NIBBLER_EVENT line.
       const direct = parseEventLine(line);
-      if (direct) st.events.push(direct);
+      if (direct) {
+        st.eventCount += 1;
+        st.events.push(direct);
+      }
 
       // Then try NDJSON from stream-json output format.
       const ndjsonTexts = extractTextsFromNdjsonLine(line);
       for (const text of ndjsonTexts) {
         for (const l of text.split('\n')) {
           const ev = parseEventLine(l);
-          if (ev) st.events.push(ev);
+          if (ev) {
+            st.eventCount += 1;
+            st.events.push(ev);
+          }
         }
       }
     };
@@ -265,10 +333,10 @@ function resolveCursorModel(taskType: RunnerTaskType): string | null {
   if (global) return global;
 
   if (taskType === 'plan') {
-    return process.env.NIBBLER_CURSOR_MODEL_PLAN?.trim() || 'gpt-5.2-codex-xhigh';
+    return process.env.NIBBLER_CURSOR_MODEL_PLAN?.trim() || null;
   }
 
-  return process.env.NIBBLER_CURSOR_MODEL_EXECUTE?.trim() || 'gpt-5.2-high';
+  return process.env.NIBBLER_CURSOR_MODEL_EXECUTE?.trim() || 'gemini-3-flash';
 }
 
 function safeEnvForVerbose(envVars: Record<string, string>, configDir: string): Record<string, string> {
@@ -334,6 +402,20 @@ function extractTextsFromNdjsonLine(line: string): string[] {
     return [];
   } catch {
     return [];
+  }
+}
+
+async function waitForProcessExit(proc: ReturnType<typeof execa>, timeoutMs: number): Promise<void> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    await Promise.race([
+      proc.then(() => undefined).catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => resolve(), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

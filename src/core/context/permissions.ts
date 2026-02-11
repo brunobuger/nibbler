@@ -46,6 +46,10 @@ export function generatePermissionsConfig(roleDef: RoleDefinition, _contract: Co
   allow.push(writeToken('.nibbler-staging/**'));
 
   const deny: string[] = [
+    // Never allow agents to read or write git internals.
+    // Worktrees rely on `.git/worktrees/**` metadata; accidental deletion breaks orchestration.
+    readToken('.git/**'),
+    writeToken('.git/**'),
     writeToken('.nibbler/**'),
     writeToken('.cursor/rules/**'),
     // Block reading real env files (may contain secrets), but allow `.env.example`.
@@ -89,7 +93,8 @@ export function generatePlanPermissionsConfig(): CursorCliConfig {
       deny: [
         writeToken('.nibbler/**'),
         writeToken('.cursor/rules/**'),
-        writeToken('**/*'), // deny writes anywhere else
+        // NOTE: do NOT add `Write(**/*)` here. Cursor treats deny as authoritative, so it would
+        // also block writes to `.nibbler-staging/**` despite being in allow.
         // Block reading real env files (may contain secrets), but allow `.env.example`.
         readToken('.env'),
         readToken('**/.env'),

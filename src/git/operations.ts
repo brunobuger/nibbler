@@ -133,8 +133,9 @@ function isNibblerEngineArtifactPath(p: string): boolean {
   if (p.startsWith('dist/')) return true;
   if (p.startsWith('out/')) return true;
   if (p.startsWith('coverage/')) return true;
-  if (p.startsWith('test-results/')) return true;
-  if (p.startsWith('playwright-report/')) return true;
+  // Playwright output dirs (often nested under a package like `tests/`)
+  if (p.startsWith('test-results/') || p.includes('/test-results/')) return true;
+  if (p.startsWith('playwright-report/') || p.includes('/playwright-report/')) return true;
   if (p.startsWith('.turbo/')) return true;
   if (p.startsWith('.vercel/')) return true;
   if (p.startsWith('.netlify/')) return true;
@@ -209,15 +210,23 @@ function isCommonNoisePath(p: string): boolean {
     'dist/',
     'out/',
     'coverage/',
+    // Playwright output dirs (root-level)
     'test-results/',
     'playwright-report/',
+    // Playwright output dirs (nested under a package like `tests/`)
+    'tests/test-results/',
+    'tests/playwright-report/',
     '.turbo/',
     '.vercel/',
     '.netlify/',
     '.cache/',
     '.parcel-cache/',
   ];
-  return prefixes.some((pre) => p.startsWith(pre));
+  if (prefixes.some((pre) => p.startsWith(pre))) return true;
+  // Also treat any nested Playwright output dir as noise (e.g. `packages/foo/test-results/**`).
+  if (p.includes('/test-results/')) return true;
+  if (p.includes('/playwright-report/')) return true;
+  return false;
 }
 
 export async function diffFiles(
@@ -281,7 +290,9 @@ export async function resetHard(repo: GitRepo, commit: string): Promise<void> {
 }
 
 export async function clean(repo: GitRepo): Promise<void> {
-  await runRaw(repo, ['clean', '-fd']);
+  // Preserve engine artifacts even if the repo's `.gitignore` changes (e.g. scaffold generators overwriting it).
+  // These paths are required for orchestration, evidence, and plan artifact materialization.
+  await runRaw(repo, ['clean', '-fd', '-e', '.nibbler/', '-e', '.nibbler-staging/', '-e', '.cursor/']);
 }
 
 export async function commit(repo: GitRepo, message: string, opts?: { includeEngineArtifacts?: boolean }): Promise<void> {
@@ -305,5 +316,46 @@ export async function commit(repo: GitRepo, message: string, opts?: { includeEng
   }
 
   await runRaw(repo, ['commit', '-m', message]);
+}
+
+export async function stashPush(
+  repo: GitRepo,
+  opts?: { includeUntracked?: boolean; message?: string }
+): Promise<{ stashed: boolean; output: string }> {
+  const includeUntracked = opts?.includeUntracked ?? false;
+  const message = opts?.message ?? `nibbler:auto-stash:${Date.now()}:${process.pid}`;
+  const args = ['stash', 'push', '-m', message];
+  if (includeUntracked) args.push('--include-untracked');
+
+  // `git stash push` returns exit 0 even when there is nothing to stash.
+  const out = await runRaw(repo, args);
+  const stashed = !/No local changes to save/i.test(out);
+  return { stashed, output: out };
+}
+
+export async function stashPop(
+  repo: GitRepo,
+  opts?: { ref?: string }
+): Promise<{ applied: boolean; hadConflicts: boolean; output: string }> {
+  const ref = opts?.ref;
+  const args = ['stash', 'pop'];
+  if (ref) args.push(ref);
+
+  try {
+    const out = await runRaw(repo, args);
+    return { applied: true, hadConflicts: false, output: out };
+  } catch (err: any) {
+    // `git stash pop` exits non-zero if it had conflicts, but may still apply partially.
+    const stdout = typeof err?.stdout === 'string' ? err.stdout : '';
+    const stderr = typeof err?.stderr === 'string' ? err.stderr : '';
+    const combined = [stdout, stderr].filter(Boolean).join('\n');
+    const hadConflicts =
+      /CONFLICT/i.test(combined) ||
+      /Merge conflict/i.test(combined) ||
+      /needs merge/i.test(combined) ||
+      /could not apply/i.test(combined);
+
+    return { applied: false, hadConflicts, output: combined || String(err?.message ?? err) };
+  }
 }
 

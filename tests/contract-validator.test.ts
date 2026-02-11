@@ -28,7 +28,7 @@ function baseValidContract(): Contract {
         id: 'start',
         actors: ['architect'],
         inputBoundaries: ['src/**'],
-        outputBoundaries: ['src/**'],
+        outputBoundaries: ['src/architect/**'],
         preconditions: [{ type: 'always' }],
         completionCriteria: [{ type: 'diff_non_empty' }],
         successors: [{ on: 'done', next: 'end' }]
@@ -37,7 +37,7 @@ function baseValidContract(): Contract {
         id: 'end',
         actors: ['worker'],
         inputBoundaries: ['src/**'],
-        outputBoundaries: ['src/**'],
+        outputBoundaries: ['src/worker/**'],
         preconditions: [{ type: 'always' }],
         completionCriteria: [{ type: 'diff_non_empty' }],
         successors: [],
@@ -45,7 +45,18 @@ function baseValidContract(): Contract {
       }
     ],
     gates: [
-      { id: 'plan', trigger: 'start->end', audience: 'PO', requiredInputs: [], outcomes: { approve: 'end', reject: 'start' } }
+      {
+        id: 'plan',
+        trigger: 'start->end',
+        audience: 'PO',
+        approvalScope: 'phase_output',
+        approvalExpectations: ['Approve phase output'],
+        businessOutcomes: ['Decision is recorded'],
+        functionalScope: ['Transition to next phase is authorized'],
+        outOfScope: ['No additional scope expansion'],
+        requiredInputs: [],
+        outcomes: { approve: 'end', reject: 'start' }
+      }
     ],
     globalLifetime: { maxTimeMs: 1000 },
     sharedScopes: [],
@@ -111,9 +122,64 @@ describe('contract validator', () => {
 
   it('Rule 5.5: requires at least one PO gate', () => {
     const c = baseValidContract();
-    c.gates = [{ id: 'x', trigger: 't', audience: 'architect', requiredInputs: [], outcomes: { approve: 'end', reject: 'start' } }];
+    c.gates = [{
+      id: 'x',
+      trigger: 't',
+      audience: 'architect',
+      approvalScope: 'phase_output',
+      approvalExpectations: ['Approve technical output'],
+      businessOutcomes: ['Technical governance checkpoint'],
+      functionalScope: ['Transition is controlled'],
+      outOfScope: ['No product-level approval'],
+      requiredInputs: [],
+      outcomes: { approve: 'end', reject: 'start' }
+    }];
     const errs = validateContract(c);
     expect(errs.some((e) => e.rule === '5.5')).toBe(true);
+  });
+
+  it('Rule 3.2: rejects missing approvalScope', () => {
+    const c = baseValidContract();
+    (c.gates[0] as any).approvalScope = undefined;
+    const errs = validateContract(c);
+    expect(errs.some((e) => e.rule === '3.2')).toBe(true);
+  });
+
+  it('Rule 3.2: planning PO gate must use build_requirements or both', () => {
+    const c = baseValidContract();
+    c.gates[0]!.trigger = 'planning->end';
+    c.gates[0]!.approvalScope = 'phase_output';
+    const errs = validateContract(c);
+    expect(errs.some((e) => e.rule === '3.2')).toBe(true);
+  });
+
+  it('Rule 3.2: planning PO gate requires vision + architecture inputs', () => {
+    const c = baseValidContract();
+    c.gates[0]!.trigger = 'planning->end';
+    c.gates[0]!.approvalScope = 'build_requirements';
+    c.gates[0]!.approvalExpectations = ['Approve build requirements'];
+    c.gates[0]!.businessOutcomes = ['Deliver core value'];
+    c.gates[0]!.functionalScope = ['Deliver core flow'];
+    c.gates[0]!.requiredInputs = [];
+    const errs = validateContract(c);
+    expect(errs.some((e) => e.message.includes("vision.md"))).toBe(true);
+    expect(errs.some((e) => e.message.includes("architecture.md"))).toBe(true);
+  });
+
+  it('Rule 3.2: planning PO gate requires non-empty business/functional scope', () => {
+    const c = baseValidContract();
+    c.gates[0]!.trigger = 'planning->end';
+    c.gates[0]!.approvalScope = 'build_requirements';
+    c.gates[0]!.approvalExpectations = ['Approve build requirements'];
+    c.gates[0]!.requiredInputs = [
+      { name: 'vision', kind: 'path', value: 'vision.md' },
+      { name: 'architecture', kind: 'path', value: 'architecture.md' },
+    ];
+    c.gates[0]!.businessOutcomes = [];
+    c.gates[0]!.functionalScope = [];
+    const errs = validateContract(c);
+    expect(errs.some((e) => e.message.includes('businessOutcomes'))).toBe(true);
+    expect(errs.some((e) => e.message.includes('functionalScope'))).toBe(true);
   });
 
   it('Rule 4.2: requires budget exhaustion escalation per role', () => {

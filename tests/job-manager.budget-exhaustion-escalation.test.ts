@@ -93,11 +93,14 @@ describe('JobManager (budget exhaustion escalation)', () => {
 
     const out = await jm.runJob(job, contract, { roles: ['worker'] });
     expect(out.ok).toBe(false);
+    if (out.ok) throw new Error('expected escalation');
     expect(out.reason).toBe('escalated');
     expect(runner.startedRoles).toContain('architect');
 
     const ledgerContent = await readFile(jobPaths.ledgerPath, 'utf8');
     expect(ledgerContent).toContain('"type":"escalation"');
+    expect((ledgerContent.match(/"type":"session_feedback"/g) ?? []).length).toBeGreaterThanOrEqual(1);
+    expect(ledgerContent).toContain('"engineHint"');
   });
 });
 
