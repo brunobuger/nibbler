@@ -20,7 +20,7 @@
 Nibbler is a **supervisor for AI-powered software development**. Think of it as a project manager that coordinates multiple AI agents (using Cursor CLI) to build software — with built-in guardrails to keep everything on track.
 
 Instead of manually directing AI coding sessions, Nibbler:
-- 🎯 **Guides AI agents** through defined roles (architect, backend dev, frontend dev, tester, etc.)
+- 🎯 **Guides AI agents** through defined roles (architect, backend dev, frontend dev, devops, docs, etc.)
 - 🛡️ **Enforces boundaries** so each agent only works on what they're supposed to
 - 📝 **Tracks everything** in an append-only audit log
 - ✅ **Verifies work** at each step before moving forward
@@ -44,67 +44,67 @@ Nibbler provides all of this by treating AI agents like a governed engineering t
 
 ---
 
-## How It Works: Building a Web App
+## How It Works
 
-Here's what happens when you ask Nibbler to build a web application:
+Two commands cover the main workflow — `nibbler init` to establish governance once, then `nibbler build` for every task.
+
+### CLI Command Map
+
+```mermaid
+flowchart LR
+    subgraph once["Setup  (once per project)"]
+        Init["nibbler init\npropose & approve\ngovernance contract"]
+    end
+
+    subgraph cycle["Per feature / task"]
+        Build["nibbler build\nfull job lifecycle"]
+        Fix["nibbler fix\ncorrect prior output"]
+    end
+
+    subgraph ops["Anytime"]
+        Ops["nibbler status  ·  nibbler list\nnibbler resume  ·  nibbler history"]
+    end
+
+    once --> cycle
+    Build -.-> Fix
+    Fix -.-> Build
+    cycle -.-> ops
+    Ops -.->|"resume"| Build
+```
+
+### Job Lifecycle
+
+Every `nibbler build` runs through four phases with human approval gates — one before any code is written, one before anything ships:
 
 ```mermaid
 flowchart TD
-    Start([You: 'nibbler init']) --> Init[Setup Governance Contract]
-    Init --> InitArch[AI Architect proposes team structure<br/>roles, phases, verification methods]
-    InitArch --> InitApprove{You approve<br/>contract?}
-    InitApprove -->|No| InitArch
-    InitApprove -->|Yes| InitCommit[Contract saved to .nibbler/]
-    
-    InitCommit --> Build([You: 'nibbler build "Create a task manager app"'])
-    
-    Build --> Discovery[Discovery Phase]
-    Discovery --> DiscAI[AI asks questions about your app<br/>users, features, tech stack]
-    DiscAI --> DiscDocs[Generates vision.md & architecture.md]
-    
-    DiscDocs --> Planning[Planning Phase]
-    Planning --> PlanArch[AI Architect creates plan<br/>acceptance criteria, task breakdown]
-    PlanArch --> PlanGate{You approve<br/>plan?}
-    PlanGate -->|No| Planning
-    PlanGate -->|Yes| Execution
-    
-    Execution[Execution Phase] --> ExecRoles[AI agents work in sequence<br/>each in their defined scope]
-    ExecRoles --> Backend[Backend Role<br/>implements API & database]
-    Backend --> BackendTest{Tests pass?<br/>Scope OK?}
-    BackendTest -->|No| Backend
-    BackendTest -->|Yes| Frontend[Frontend Role<br/>builds UI components]
-    Frontend --> FrontendTest{Tests pass?<br/>Scope OK?}
-    FrontendTest -->|No| Frontend
-    FrontendTest -->|Yes| SDET[Testing Role<br/>adds integration tests]
-    SDET --> SDETTest{Tests pass?<br/>Scope OK?}
-    SDETTest -->|No| SDET
-    SDETTest -->|Yes| Ship
-    
-    Ship[Ship Phase] --> Docs[Docs Role<br/>writes README & documentation]
-    Docs --> ShipGate{You approve<br/>to ship?}
-    ShipGate -->|No| Ship
-    ShipGate -->|Yes| Done([Complete!<br/>Code merged to your branch])
-    
-    style Start fill:#e1f5ff
-    style Build fill:#e1f5ff
-    style Done fill:#d4edda
-    style InitApprove fill:#fff3cd
-    style PlanGate fill:#fff3cd
-    style ShipGate fill:#fff3cd
-    style BackendTest fill:#f8d7da
-    style FrontendTest fill:#f8d7da
-    style SDETTest fill:#f8d7da
+    Start(["nibbler build 'requirement'"])
+
+    D["1 · Discovery\nAI interviews you\nvision.md · architecture.md"]
+
+    P["2 · Planning\nArchitect creates task breakdown\nper-role plans · acceptance criteria"]
+
+    PG{"PLAN Gate"}
+
+    E["3 · Execution\nRoles work in sequence\nauto-verified after each handoff"]
+
+    S["4 · Ship\nDocs written · final checks"]
+
+    SG{"SHIP Gate"}
+
+    Done(["Merged to your branch\nAudit trail in .nibbler/jobs/"])
+
+    Start --> D --> P --> PG
+    PG -->|"✗  Reject + feedback"| P
+    PG -->|"✓  Approve"| E
+    E -->|"Tests fail — auto-retry"| E
+    E -->|"All roles done"| S
+    S --> SG
+    SG -->|"✗  Reject + feedback"| S
+    SG -->|"✓  Approve"| Done
 ```
 
-### Key Points:
-
-1. **Init once per project** — Nibbler creates a governance contract defining roles, workflows, and checkpoints
-2. **Discovery** — AI interviews you to understand what you're building
-3. **Planning** — AI architect breaks down the work and you approve the plan
-4. **Execution** — Multiple specialized AI agents work sequentially, each verified before the next starts
-5. **Ship** — Final approval before code is merged to your branch
-
-All work happens in isolated git worktrees, so your working directory stays clean. Every decision and change is logged for full auditability.
+> All work runs in an isolated git worktree — your branch stays clean until you approve the SHIP gate. Every decision is logged in an append-only ledger.
 
 ---
 
@@ -149,7 +149,7 @@ That's it! Nibbler will guide AI agents through discovery, planning, implementat
 ### `nibbler init`
 
 Sets up governance for your project (and runs discovery to produce `vision.md` + `architecture.md` if they're missing). The AI Architect proposes:
-- **Roles** (e.g., backend, frontend, testing, docs)
+- **Roles** (e.g., backend, frontend, devops, docs)
 - **Phases** (planning → execution → ship)
 - **Gates** (where you approve or reject)
 - **Verification methods** (tests, lints, scope checks)
@@ -285,7 +285,7 @@ Each role has:
 - **Budget** — Iteration limits before escalation
 - **Verification** — How their work is checked
 
-Example roles: architect, backend, frontend, sdet (testing), docs
+Example roles: architect, backend, frontend, devops, docs
 
 ### Phases
 
@@ -475,7 +475,7 @@ nibbler build "Create a REST API for a book library with CRUD operations"
 Nibbler will:
 1. Ask about authentication, database, API style
 2. Generate vision.md and architecture.md
-3. Create a plan with backend + testing roles
+3. Create a plan with backend + devops roles
 4. Implement the API with tests
 5. Generate API documentation
 
@@ -515,9 +515,9 @@ Nibbler will:
 
 See `docs/contracts/` for example governance structures:
 
-- **Web Application** — Backend, frontend, testing, docs roles
-- **API Service** — Backend, testing, docs roles
-- **CLI Tool** — Core, testing, docs roles
+- **Web Application** — Backend, frontend, devops, docs roles
+- **API Service** — Backend, devops, docs roles
+- **CLI Tool** — Core, devops, docs roles
 
 Each example shows how to define roles, phases, gates, and verification methods.
 
